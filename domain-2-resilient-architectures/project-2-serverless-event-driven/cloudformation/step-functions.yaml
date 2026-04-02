@@ -1,0 +1,106 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  SAA Study Project 2.2 - Step Functions state machine for
+  multi-step order fulfilment workflow with retries and error handling.
+  Requires lambda-functions.yaml to be deployed first.
+
+Resources:
+
+  StepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLambdas
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:saa-process-order'
+                  - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:saa-send-email'
+                  - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:saa-update-inventory'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogDelivery
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  OrderFulfillmentStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: saa-order-fulfillment
+      RoleArn: !GetAtt StepFunctionsRole.Arn
+      StateMachineType: STANDARD
+      Definition:
+        Comment: SAA Study Project 2.2 - Order Fulfillment Workflow
+        StartAt: ValidateOrder
+        States:
+
+          ValidateOrder:
+            Type: Task
+            Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:saa-process-order'
+            Comment: Validate order fields and write to DynamoDB
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - Lambda.TooManyRequestsException
+                IntervalSeconds: 2
+                MaxAttempts: 3
+                BackoffRate: 2
+            Catch:
+              - ErrorEquals:
+                  - States.ALL
+                Next: OrderFailed
+                ResultPath: "$.error"
+            Next: FulfillmentParallel
+
+          FulfillmentParallel:
+            Type: Parallel
+            Comment: Run inventory update and confirmation email simultaneously
+            Branches:
+              - StartAt: UpdateInventory
+                States:
+                  UpdateInventory:
+                    Type: Task
+                    Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:saa-update-inventory'
+                    End: true
+              - StartAt: SendConfirmation
+                States:
+                  SendConfirmation:
+                    Type: Task
+                    Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:saa-send-email'
+                    End: true
+            Next: OrderComplete
+
+          OrderComplete:
+            Type: Succeed
+
+          OrderFailed:
+            Type: Fail
+            Error: OrderFulfillmentFailed
+            Cause: Order could not be processed. Check error details.
+
+      Tags:
+        - Key: Project
+          Value: SAA-Study
+
+Outputs:
+  StateMachineArn:
+    Value: !Ref OrderFulfillmentStateMachine
+    Description: Step Functions state machine ARN
+
+  StartExecutionCommand:
+    Value: !Sub |
+      aws stepfunctions start-execution \
+        --state-machine-arn ${OrderFulfillmentStateMachine} \
+        --input '{"orderId":"sf-test-001","item":"widget","quantity":2,"customerId":"cust-123"}'
+    Description: CLI command to start a test execution

@@ -1,0 +1,260 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  SAA Study Project 4.4 - EC2-based thumbnail generator API.
+  Deploy alongside serverless-api.yaml to compare costs at different traffic levels.
+  Uses a t3.small running 24/7 with a Flask API behind an ALB.
+
+Resources:
+
+  # ── S3 Bucket for thumbnail output ────────────────────────────────────────
+  ThumbnailBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'saa-thumbnails-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldThumbnails
+            Status: Enabled
+            ExpirationInDays: 7    # Auto-cleanup lab thumbnails
+      Tags:
+        - {Key: Project, Value: SAA-Study}
+        - {Key: Version, Value: EC2}
+
+  # ── VPC + Networking ──────────────────────────────────────────────────────
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.70.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags: [{Key: Name, Value: SAA-EC2API-VPC},{Key: Project, Value: SAA-Study}]
+
+  IGW:
+    Type: AWS::EC2::InternetGateway
+  IGWAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: {VpcId: !Ref VPC, InternetGatewayId: !Ref IGW}
+
+  PubSub1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.70.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+  PubSub2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.70.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+
+  PubRT:
+    Type: AWS::EC2::RouteTable
+    Properties: {VpcId: !Ref VPC}
+  PubRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IGWAttach
+    Properties: {RouteTableId: !Ref PubRT, DestinationCidrBlock: 0.0.0.0/0, GatewayId: !Ref IGW}
+  Sub1Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PubSub1, RouteTableId: !Ref PubRT}
+  Sub2Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PubSub2, RouteTableId: !Ref PubRT}
+
+  # ── Security Groups ───────────────────────────────────────────────────────
+  ALBSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB HTTP from internet
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0}
+
+  EC2SG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EC2 - HTTP from ALB only
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 5000, ToPort: 5000, SourceSecurityGroupId: !Ref ALBSG}
+
+  # ── IAM Role ──────────────────────────────────────────────────────────────
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - {Effect: Allow, Principal: {Service: ec2.amazonaws.com}, Action: sts:AssumeRole}
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: S3ThumbnailAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:PutObject, s3:GetObject]
+                Resource: !Sub '${ThumbnailBucket.Arn}/*'
+
+  EC2Profile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: {Roles: [!Ref EC2Role]}
+
+  # ── Launch Template ────────────────────────────────────────────────────────
+  LT:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: SAA-EC2API-LT
+      LaunchTemplateData:
+        ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64}}'
+        InstanceType: t3.small        # ~$0.0208/hr = ~$15/month 24/7
+        IamInstanceProfile: {Arn: !GetAtt EC2Profile.Arn}
+        SecurityGroupIds: [!Ref EC2SG]
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            yum update -y
+            yum install -y python3 python3-pip
+            pip3 install flask boto3 Pillow requests
+
+            cat > /home/ec2-user/app.py << 'PYAPP'
+            from flask import Flask, request, jsonify
+            import boto3, io, uuid, urllib.request, time
+            from PIL import Image
+
+            app = Flask(__name__)
+            s3 = boto3.client('s3')
+            BUCKET = '${ThumbnailBucket}'
+
+            @app.route('/health')
+            def health():
+                return 'OK', 200
+
+            @app.route('/thumbnail', methods=['POST'])
+            def thumbnail():
+                start = time.time()
+                data = request.get_json()
+                url  = data.get('image_url')
+                if not url:
+                    return jsonify({'error': 'image_url required'}), 400
+
+                with urllib.request.urlopen(url) as r:
+                    img = Image.open(io.BytesIO(r.read()))
+                img.thumbnail((300, 300))
+                buf = io.BytesIO()
+                img.save(buf, format='JPEG')
+                buf.seek(0)
+
+                key = f'thumbnails/{uuid.uuid4()}.jpg'
+                s3.put_object(Bucket=BUCKET, Key=key, Body=buf, ContentType='image/jpeg')
+
+                duration_ms = round((time.time() - start) * 1000)
+                return jsonify({
+                    'thumbnail_url': f's3://{BUCKET}/{key}',
+                    'duration_ms': duration_ms,
+                    'compute': 'EC2 t3.small (always-on, ~$15/month)'
+                })
+
+            if __name__ == '__main__':
+                app.run(host='0.0.0.0', port=5000)
+            PYAPP
+
+            # Run as a systemd service so it restarts on reboot
+            cat > /etc/systemd/system/thumbnail-api.service << 'SVC'
+            [Unit]
+            Description=Thumbnail Generator API (EC2 version)
+            After=network.target
+
+            [Service]
+            User=ec2-user
+            WorkingDirectory=/home/ec2-user
+            ExecStart=/usr/bin/python3 /home/ec2-user/app.py
+            Restart=always
+
+            [Install]
+            WantedBy=multi-user.target
+            SVC
+
+            systemctl daemon-reload
+            systemctl enable thumbnail-api
+            systemctl start thumbnail-api
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - {Key: Name, Value: SAA-EC2-API}
+              - {Key: Project, Value: SAA-Study}
+              - {Key: Version, Value: EC2-always-on}
+
+  # ── ALB + ASG ──────────────────────────────────────────────────────────────
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: SAA-EC2API-ALB
+      Scheme: internet-facing
+      Type: application
+      Subnets: [!Ref PubSub1, !Ref PubSub2]
+      SecurityGroups: [!Ref ALBSG]
+
+  TG:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: SAA-EC2API-TG
+      Port: 5000
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 15
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions: [{Type: forward, TargetGroupArn: !Ref TG}]
+
+  ASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: SAA-EC2API-ASG
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LT
+        Version: !GetAtt LT.LatestVersionNumber
+      MinSize: '1'
+      MaxSize: '3'
+      DesiredCapacity: '1'          # 1 instance = ~$15/month regardless of traffic
+      VPCZoneIdentifier: [!Ref PubSub1, !Ref PubSub2]
+      TargetGroupARNs: [!Ref TG]
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 120
+
+Outputs:
+  ALBEndpoint:
+    Value: !Sub 'http://${ALB.DNSName}'
+    Description: EC2-based API endpoint
+
+  ThumbnailBucketName:
+    Value: !Ref ThumbnailBucket
+    Export: {Name: SAA-Thumbnail-Bucket}
+
+  EC2MonthlyCost:
+    Value: >
+      Estimated: ~$15/month for t3.small (24/7) +
+      ~$16/month for ALB + minimal S3/data transfer.
+      Total: ~$31/month regardless of request volume.
+
+  TestCommand:
+    Value: !Sub |
+      curl -X POST http://${ALB.DNSName}/thumbnail \
+        -H "Content-Type: application/json" \
+        -d '{"image_url":"https://picsum.photos/800/600"}'
+    Description: Send a test thumbnail request to the EC2 API

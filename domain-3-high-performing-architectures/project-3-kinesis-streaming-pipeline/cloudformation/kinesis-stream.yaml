@@ -1,0 +1,119 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  SAA Study Project 3.3 - Kinesis Data Stream for clickstream ingestion
+  with 2 shards and a 24-hour retention period.
+
+Resources:
+
+  ClickstreamStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: saa-clickstream
+      ShardCount: 2
+      RetentionPeriodHours: 24
+      StreamModeDetails:
+        StreamMode: PROVISIONED      # Fixed shard count (vs ON_DEMAND)
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: alias/aws/kinesis    # AWS managed Kinesis key
+      Tags:
+        - {Key: Project, Value: SAA-Study}
+
+  # ── S3 bucket for Firehose delivery ───────────────────────────────────────
+  FirehoseDeliveryBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'saa-firehose-delivery-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldData
+            Status: Enabled
+            ExpirationInDays: 30    # Auto-delete lab data after 30 days
+      Tags:
+        - {Key: Project, Value: SAA-Study}
+
+  # ── IAM Role for Kinesis producer (EC2/Lambda sending events) ────────────
+  ProducerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: saa-kinesis-producer-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [ec2.amazonaws.com, lambda.amazonaws.com]
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: KinesisWriteAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:PutRecord
+                  - kinesis:PutRecords
+                  - kinesis:DescribeStream
+                Resource: !GetAtt ClickstreamStream.Arn
+
+  ProducerProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref ProducerRole]
+
+  # ── IAM Role for Lambda consumer ─────────────────────────────────────────
+  ConsumerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: saa-kinesis-consumer-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: KinesisReadAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:GetRecords
+                  - kinesis:GetShardIterator
+                  - kinesis:DescribeStream
+                  - kinesis:DescribeStreamSummary
+                  - kinesis:ListShards
+                  - kinesis:ListStreams
+                Resource: !GetAtt ClickstreamStream.Arn
+
+Outputs:
+  StreamName:
+    Value: !Ref ClickstreamStream
+    Export: {Name: SAA-Kinesis-StreamName}
+
+  StreamArn:
+    Value: !GetAtt ClickstreamStream.Arn
+    Export: {Name: SAA-Kinesis-StreamArn}
+
+  DeliveryBucketName:
+    Value: !Ref FirehoseDeliveryBucket
+    Export: {Name: SAA-Firehose-BucketName}
+
+  ConsumerRoleArn:
+    Value: !GetAtt ConsumerRole.Arn
+    Export: {Name: SAA-Kinesis-ConsumerRoleArn}
+
+  SendTestEventCommand:
+    Value: !Sub |
+      aws kinesis put-record \
+        --stream-name saa-clickstream \
+        --partition-key "user-123" \
+        --data '{"userId":"user-123","page":"/home","action":"pageview","ts":"2026-04-01T10:00:00Z"}' \
+        --cli-binary-format raw-in-base64-out
+    Description: Send a test event to the stream

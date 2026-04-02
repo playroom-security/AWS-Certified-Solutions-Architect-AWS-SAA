@@ -1,0 +1,107 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  SAA Study Project 1.2 - AWS WAF Web ACL with managed rules
+  and custom rate-limiting and SQL injection rules.
+  Associate with an existing ALB ARN.
+
+Parameters:
+  ALBArn:
+    Type: String
+    Description: ARN of the ALB to associate the WAF Web ACL with
+
+Resources:
+
+  WebACL:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: SAA-Study-WebACL
+      Scope: REGIONAL
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: SAA-WebACL
+      Rules:
+
+        # Rule 1: AWS Core Managed Rule Set
+        - Name: AWSManagedRulesCommonRuleSet
+          Priority: 1
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: CommonRuleSet
+
+        # Rule 2: Rate limiting - 100 requests per 5 minutes per IP
+        - Name: RateLimitRule
+          Priority: 2
+          Action:
+            Block: {}
+          Statement:
+            RateBasedStatement:
+              Limit: 100
+              AggregateKeyType: IP
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: RateLimitRule
+
+        # Rule 3: Block SQL Injection in query string
+        - Name: BlockSQLInjection
+          Priority: 3
+          Action:
+            Block: {}
+          Statement:
+            SqliMatchStatement:
+              FieldToMatch:
+                QueryString: {}
+              TextTransformations:
+                - Priority: 1
+                  Type: URL_DECODE
+                - Priority: 2
+                  Type: HTML_ENTITY_DECODE
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: SQLInjectionRule
+
+        # Rule 4: Block XSS in body
+        - Name: BlockXSS
+          Priority: 4
+          Action:
+            Block: {}
+          Statement:
+            XssMatchStatement:
+              FieldToMatch:
+                Body: {}
+              TextTransformations:
+                - Priority: 1
+                  Type: URL_DECODE
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: XSSRule
+
+      Tags:
+        - Key: Project
+          Value: SAA-Study
+        - Key: Domain
+          Value: Domain1-Security
+
+  # Associate WAF with ALB
+  WebACLAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Properties:
+      ResourceArn: !Ref ALBArn
+      WebACLArn: !GetAtt WebACL.Arn
+
+Outputs:
+  WebACLArn:
+    Value: !GetAtt WebACL.Arn
+    Description: WAF Web ACL ARN

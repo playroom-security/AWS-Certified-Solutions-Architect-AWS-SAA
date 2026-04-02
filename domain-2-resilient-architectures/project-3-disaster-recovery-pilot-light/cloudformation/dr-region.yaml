@@ -1,0 +1,213 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  SAA Study Project 2.3 - DR REGION stack (deploy in us-west-2).
+  Pilot light: VPC + ALB + ASG (desired=0) ready for failover.
+  RDS read replica is created separately via CLI (see primary-region.yaml output).
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t3.micro
+  AmiId:
+    Type: String
+    Description: >
+      AMI ID of the pre-baked web server image copied from us-east-1.
+      Use the AMI copy command from the README to get this value.
+    Default: ami-0abcdef1234567890
+
+Resources:
+
+  # ── VPC ───────────────────────────────────────────────────────────────────
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.20.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags: [{Key: Name, Value: SAA-DR-VPC},{Key: Project, Value: SAA-Study}]
+
+  IGW:
+    Type: AWS::EC2::InternetGateway
+  IGWAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: {VpcId: !Ref VPC, InternetGatewayId: !Ref IGW}
+
+  PubSub1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.20.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+  PubSub2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.20.3.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+  PrivSub1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.20.2.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+  PrivSub2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.20.4.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+
+  NatEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: IGWAttach
+    Properties: {Domain: vpc}
+  NatGW:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEIP.AllocationId
+      SubnetId: !Ref PubSub1
+
+  PubRT:
+    Type: AWS::EC2::RouteTable
+    Properties: {VpcId: !Ref VPC}
+  PubRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IGWAttach
+    Properties: {RouteTableId: !Ref PubRT, DestinationCidrBlock: 0.0.0.0/0, GatewayId: !Ref IGW}
+  PubSub1RTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PubSub1, RouteTableId: !Ref PubRT}
+  PubSub2RTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PubSub2, RouteTableId: !Ref PubRT}
+  PrivRT:
+    Type: AWS::EC2::RouteTable
+    Properties: {VpcId: !Ref VPC}
+  PrivRoute:
+    Type: AWS::EC2::Route
+    Properties: {RouteTableId: !Ref PrivRT, DestinationCidrBlock: 0.0.0.0/0, NatGatewayId: !Ref NatGW}
+  PrivSub1RTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PrivSub1, RouteTableId: !Ref PrivRT}
+  PrivSub2RTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PrivSub2, RouteTableId: !Ref PrivRT}
+
+  # ── Security Groups ───────────────────────────────────────────────────────
+  DRALBSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: DR ALB public access
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0}
+  DRWebSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: DR web servers - HTTP from ALB only
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 80, ToPort: 80, SourceSecurityGroupId: !Ref DRALBSG}
+
+  # ── EC2 IAM Role ──────────────────────────────────────────────────────────
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - {Effect: Allow, Principal: {Service: ec2.amazonaws.com}, Action: sts:AssumeRole}
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+  EC2Profile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: {Roles: [!Ref EC2Role]}
+
+  # ── DR Launch Template ────────────────────────────────────────────────────
+  DRLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: SAA-DR-LT
+      LaunchTemplateData:
+        ImageId: !Ref AmiId          # Pre-baked AMI copied from primary region
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile: {Arn: !GetAtt EC2Profile.Arn}
+        SecurityGroupIds: [!Ref DRWebSG]
+        UserData:
+          Fn::Base64: |
+            #!/bin/bash
+            # Ensure httpd is running on startup from pre-baked AMI
+            systemctl start httpd || (yum install -y httpd && systemctl start httpd)
+            systemctl enable httpd
+            AZ=$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone)
+            echo "<h1>DR REGION (us-west-2) - FAILOVER ACTIVE</h1><p>AZ: $AZ</p>" > /var/www/html/index.html
+            echo "OK" > /var/www/html/health
+        TagSpecifications:
+          - ResourceType: instance
+            Tags: [{Key: Name, Value: SAA-DR-Web},{Key: Project, Value: SAA-Study}]
+
+  # ── DR ALB ────────────────────────────────────────────────────────────────
+  DRALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: SAA-DR-ALB
+      Scheme: internet-facing
+      Type: application
+      Subnets: [!Ref PubSub1, !Ref PubSub2]
+      SecurityGroups: [!Ref DRALBSG]
+
+  DRTG:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: SAA-DR-TG
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 15
+
+  DRListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref DRALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions: [{Type: forward, TargetGroupArn: !Ref DRTG}]
+
+  # ── DR ASG — desired=0 (PILOT LIGHT: no running instances until failover) ──
+  DRASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: saa-dr-asg
+      LaunchTemplate:
+        LaunchTemplateId: !Ref DRLaunchTemplate
+        Version: !GetAtt DRLaunchTemplate.LatestVersionNumber
+      MinSize: '0'
+      MaxSize: '4'
+      DesiredCapacity: '0'          # ← KEY: no instances running (cost saving)
+      VPCZoneIdentifier: [!Ref PrivSub1, !Ref PrivSub2]
+      TargetGroupARNs: [!Ref DRTG]
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 90
+      Tags:
+        - {Key: Name, Value: SAA-DR-Web, PropagateAtLaunch: true}
+        - {Key: Project, Value: SAA-Study, PropagateAtLaunch: true}
+
+Outputs:
+  DRALBDNSName:
+    Value: !GetAtt DRALB.DNSName
+    Description: DR ALB DNS - configure as Route 53 failover SECONDARY record
+
+  DRASGName:
+    Value: !Ref DRASG
+    Description: Used in dr-failover.sh to scale up during failover
+
+  ScaleUpCommand:
+    Value: !Sub |
+      aws autoscaling update-auto-scaling-group \
+        --auto-scaling-group-name ${DRASG} \
+        --desired-capacity 2 --min-size 2 \
+        --region us-west-2
+    Description: Run this during failover to start DR instances

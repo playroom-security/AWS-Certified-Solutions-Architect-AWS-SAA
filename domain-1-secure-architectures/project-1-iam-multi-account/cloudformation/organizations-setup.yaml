@@ -1,0 +1,97 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  SAA Study Project 1.1 - AWS Organizations OU Structure
+  NOTE: This template creates the OU scaffold. Run from the Management account.
+  AWS Organizations itself must already be enabled before deploying.
+
+Resources:
+
+  DevelopmentOU:
+    Type: AWS::Organizations::OrganizationalUnit
+    Properties:
+      Name: Development
+      ParentId: !Sub '${AWS::AccountId}'  # Replace with your root OU ID from console
+      Tags:
+        - Key: Project
+          Value: SAA-Study
+        - Key: Domain
+          Value: Domain1-Security
+
+  ProductionOU:
+    Type: AWS::Organizations::OrganizationalUnit
+    Properties:
+      Name: Production
+      ParentId: !Sub '${AWS::AccountId}'  # Replace with your root OU ID from console
+      Tags:
+        - Key: Project
+          Value: SAA-Study
+        - Key: Domain
+          Value: Domain1-Security
+
+  # SCP: Deny Root User
+  DenyRootSCP:
+    Type: AWS::Organizations::Policy
+    Properties:
+      Name: DenyRootUserActions
+      Type: SERVICE_CONTROL_POLICY
+      Description: Denies all actions by the root user
+      Content: |
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "DenyRootUserActions",
+              "Effect": "Deny",
+              "Action": "*",
+              "Resource": "*",
+              "Condition": {
+                "StringLike": {
+                  "aws:PrincipalArn": "arn:aws:iam::*:root"
+                }
+              }
+            }
+          ]
+        }
+      Tags:
+        - Key: Project
+          Value: SAA-Study
+
+  # SCP: Restrict Regions
+  RestrictRegionsSCP:
+    Type: AWS::Organizations::Policy
+    Properties:
+      Name: RestrictToApprovedRegions
+      Type: SERVICE_CONTROL_POLICY
+      Description: Restricts workloads to us-east-1 and us-west-2 only
+      Content: |
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "DenyNonApprovedRegions",
+              "Effect": "Deny",
+              "NotAction": [
+                "iam:*", "organizations:*", "route53:*",
+                "budgets:*", "cloudfront:*", "sts:*"
+              ],
+              "Resource": "*",
+              "Condition": {
+                "StringNotEquals": {
+                  "aws:RequestedRegion": ["us-east-1", "us-west-2"]
+                }
+              }
+            }
+          ]
+        }
+      Tags:
+        - Key: Project
+          Value: SAA-Study
+
+Outputs:
+  DevelopmentOUId:
+    Description: Development OU ID
+    Value: !GetAtt DevelopmentOU.Id
+
+  ProductionOUId:
+    Description: Production OU ID
+    Value: !GetAtt ProductionOU.Id

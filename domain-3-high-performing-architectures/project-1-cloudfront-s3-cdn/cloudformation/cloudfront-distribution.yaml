@@ -1,0 +1,163 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  SAA Study Project 3.1 - CloudFront distribution with private S3 origin,
+  Origin Access Control (OAC), HTTPS redirect, and caching.
+  ACM certificate must exist in us-east-1 before deploying.
+
+Parameters:
+  DomainName:
+    Type: String
+    Default: cdn.saa-study.example.com
+    Description: Custom domain for CloudFront (update to your domain)
+  CertificateArn:
+    Type: String
+    Default: ""
+    Description: ACM certificate ARN in us-east-1 (leave blank to skip custom domain)
+  PriceClass:
+    Type: String
+    Default: PriceClass_100
+    AllowedValues: [PriceClass_100, PriceClass_200, PriceClass_All]
+    Description: "PriceClass_100 = North America + Europe (cheapest)"
+
+Conditions:
+  HasCustomDomain: !Not [!Equals [!Ref CertificateArn, ""]]
+
+Resources:
+
+  # ── S3 Origin Bucket (private — served only via CloudFront) ───────────────
+  OriginBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'saa-cf-origin-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - {Key: Project, Value: SAA-Study}
+
+  # ── Origin Access Control ─────────────────────────────────────────────────
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: saa-s3-oac
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # ── CloudFront Distribution ───────────────────────────────────────────────
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: SAA Study Project 3.1 - S3 + CloudFront CDN
+        PriceClass: !Ref PriceClass
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+
+        # Custom domain + ACM cert (optional)
+        Aliases: !If
+          - HasCustomDomain
+          - [!Ref DomainName]
+          - !Ref AWS::NoValue
+        ViewerCertificate: !If
+          - HasCustomDomain
+          - AcmCertificateArn: !Ref CertificateArn
+            SslSupportMethod: sni-only
+            MinimumProtocolVersion: TLSv1.2_2021
+          - CloudFrontDefaultCertificate: true
+
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt OriginBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: ''  # Empty when using OAC
+            OriginAccessControlId: !GetAtt OriginAccessControl.Id
+
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https   # HTTP → HTTPS redirect
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # Managed: CachingOptimized
+          OriginRequestPolicyId: 88a5eaf4-2fd4-4709-b370-b4c650ea3fcf  # Managed: CORS-S3Origin
+          Compress: true
+
+        # Additional behaviour for HTML files — shorter TTL
+        CacheBehaviors:
+          - PathPattern: '*.html'
+            TargetOriginId: S3Origin
+            ViewerProtocolPolicy: redirect-to-https
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad  # Managed: CachingDisabled
+            Compress: true
+
+        CustomErrorResponses:
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html   # SPA routing: 404 → serve index.html
+
+        Logging:
+          Bucket: !GetAtt LogsBucket.DomainName
+          Prefix: cf-logs/
+          IncludeCookies: false
+
+      Tags:
+        - {Key: Project, Value: SAA-Study}
+
+  # ── S3 Bucket Policy — allow only CloudFront OAC ─────────────────────────
+  OriginBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref OriginBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontOACOnly
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${OriginBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution}'
+
+  # ── CloudFront Access Logs Bucket ─────────────────────────────────────────
+  LogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'saa-cf-logs-${AWS::AccountId}'
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - {Key: Project, Value: SAA-Study}
+
+Outputs:
+  DistributionDomainName:
+    Value: !GetAtt Distribution.DomainName
+    Description: CloudFront domain (use this if no custom domain configured)
+
+  DistributionId:
+    Value: !Ref Distribution
+    Description: Use this for cache invalidations
+
+  OriginBucketName:
+    Value: !Ref OriginBucket
+    Description: Upload website files here
+
+  UploadCommand:
+    Value: !Sub 'aws s3 sync ./website/ s3://${OriginBucket}/'
+    Description: Sync website files to S3
+
+  InvalidationCommand:
+    Value: !Sub 'aws cloudfront create-invalidation --distribution-id ${Distribution} --paths "/*"'
+    Description: Invalidate all cached content after an update

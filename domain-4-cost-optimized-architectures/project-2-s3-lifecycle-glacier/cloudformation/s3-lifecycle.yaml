@@ -1,0 +1,241 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  SAA Study Project 4.2 - S3 bucket with lifecycle rules demonstrating
+  automatic object transitions through all storage tiers:
+  Standard → Standard-IA → Glacier Instant → Glacier Flexible → Deep Archive → Delete.
+  Also configures S3 Intelligent-Tiering and Cross-Region Replication.
+
+Parameters:
+  ReplicationDestinationRegion:
+    Type: String
+    Default: us-west-2
+    Description: Region for cross-region replication of compliance data
+
+Resources:
+
+  # ── Primary Lifecycle Bucket ──────────────────────────────────────────────
+  LifecycleBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'saa-lifecycle-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled             # Required for replication and object lock
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+      # ── Lifecycle Rules ───────────────────────────────────────────────────
+      LifecycleConfiguration:
+        Rules:
+
+          # Rule 1: Application logs — transition quickly, delete after 1 year
+          - Id: ApplicationLogsLifecycle
+            Status: Enabled
+            Filter:
+              Prefix: application-logs/
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA      # Infrequent access after 30 days
+              - TransitionInDays: 90
+                StorageClass: GLACIER          # Archive after 90 days
+              - TransitionInDays: 180
+                StorageClass: DEEP_ARCHIVE     # Long-term cold storage after 180 days
+            ExpirationInDays: 365             # Delete after 1 year
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30              # Delete old versions after 30 days
+
+          # Rule 2: Compliance data — 7-year retention, then delete
+          - Id: ComplianceDataLifecycle
+            Status: Enabled
+            Filter:
+              Prefix: compliance-data/
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: GLACIER_IR       # Glacier Instant - occasional audit access
+              - TransitionInDays: 365
+                StorageClass: DEEP_ARCHIVE     # Cheapest after year 1
+            ExpirationInDays: 2555            # 7 years (7 × 365)
+
+          # Rule 3: Temporary uploads — delete after 7 days (no transitions)
+          - Id: TempUploadsExpiration
+            Status: Enabled
+            Filter:
+              Prefix: temp-uploads/
+            ExpirationInDays: 7
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1          # Clean up incomplete multipart uploads
+
+          # Rule 4: User uploads — use Intelligent-Tiering (auto-managed)
+          # Objects in this prefix are handled by the IT configuration below
+          - Id: UserUploadsIntelligentTiering
+            Status: Enabled
+            Filter:
+              Prefix: user-uploads/
+            Transitions:
+              - TransitionInDays: 0
+                StorageClass: INTELLIGENT_TIERING  # Move immediately to IT
+
+          # Rule 5: Clean up expired delete markers (housekeeping)
+          - Id: CleanExpiredDeleteMarkers
+            Status: Enabled
+            Filter:
+              Prefix: ''
+            ExpiredObjectDeleteMarker: true
+
+      # ── Intelligent-Tiering Configuration ─────────────────────────────────
+      IntelligentTieringConfigurations:
+        - Id: UserUploadsIT
+          Status: Enabled
+          Prefix: user-uploads/
+          Tierings:
+            # After 90 days without access → Archive Instant Access tier
+            - AccessTier: ARCHIVE_ACCESS
+              Days: 90
+            # After 180 days without access → Deep Archive Access tier
+            - AccessTier: DEEP_ARCHIVE_ACCESS
+              Days: 180
+
+      # ── Server-Side Encryption ────────────────────────────────────────────
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256    # SSE-S3 (free, AWS manages key)
+            BucketKeyEnabled: true
+
+      # ── Metrics + Analytics ───────────────────────────────────────────────
+      MetricsConfigurations:
+        - Id: EntireBucket    # Enables per-prefix CloudWatch metrics
+
+      # ── CORS (for browser uploads) ────────────────────────────────────────
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods: [GET, PUT, POST]
+            AllowedOrigins: ['*']
+            AllowedHeaders: ['*']
+            MaxAge: 3600
+
+      Tags:
+        - {Key: Project, Value: SAA-Study}
+        - {Key: Domain, Value: Domain4-CostOptimized}
+
+  # ── S3 Storage Lens (cost visibility dashboard) ───────────────────────────
+  StorageLens:
+    Type: AWS::S3::StorageLens
+    Properties:
+      StorageLensConfiguration:
+        Id: saa-study-storage-lens
+        IsEnabled: true
+        AccountLevel:
+          BucketLevel:
+            ActivityMetrics:
+              IsEnabled: true
+            AdvancedCostOptimizationMetrics:
+              IsEnabled: true       # Shows non-current version bytes, abort incomplete multipart
+            AdvancedDataProtectionMetrics:
+              IsEnabled: false      # Paid feature — keep disabled for lab
+        Exclude:
+          Buckets: []
+        DataExport:
+          S3BucketDestination:
+            AccountId: !Ref AWS::AccountId
+            Arn: !GetAtt LensBucket.Arn
+            Format: CSV
+            OutputSchemaVersion: V_1
+      Tags:
+        - {Key: Project, Value: SAA-Study}
+
+  LensBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'saa-storage-lens-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ── Cross-Region Replication for compliance-data/ prefix ─────────────────
+  ReplicationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: saa-s3-replication-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3ReplicationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetReplicationConfiguration
+                  - s3:ListBucket
+                Resource: !GetAtt LifecycleBucket.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetObjectVersionForReplication
+                  - s3:GetObjectVersionAcl
+                  - s3:GetObjectVersionTagging
+                Resource: !Sub '${LifecycleBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ReplicateObject
+                  - s3:ReplicateDelete
+                  - s3:ReplicateTags
+                Resource: !Sub 'arn:aws:s3:::saa-lifecycle-replica-${AWS::AccountId}/*'
+
+Outputs:
+  BucketName:
+    Value: !Ref LifecycleBucket
+    Description: Primary lifecycle demo bucket
+
+  UploadTestFilesCommands:
+    Value: !Sub |
+      # Upload files to each prefix to trigger different lifecycle rules:
+
+      echo "test log data" > sample.log
+      echo "compliance report" > report.pdf
+      echo "user photo" > photo.jpg
+      echo "temporary file" > temp.txt
+
+      aws s3 cp sample.log  s3://${LifecycleBucket}/application-logs/2026/04/app.log
+      aws s3 cp report.pdf  s3://${LifecycleBucket}/compliance-data/q1-report.pdf
+      aws s3 cp photo.jpg   s3://${LifecycleBucket}/user-uploads/photo.jpg
+      aws s3 cp temp.txt    s3://${LifecycleBucket}/temp-uploads/temp.txt
+    Description: Upload test files to each prefix
+
+  ManualGlacierCommand:
+    Value: !Sub |
+      # Manually move an object to Glacier for immediate testing:
+      aws s3 cp s3://${LifecycleBucket}/compliance-data/q1-report.pdf \
+                s3://${LifecycleBucket}/compliance-data/q1-report.pdf \
+                --storage-class GLACIER
+
+      # Check the storage class:
+      aws s3api head-object \
+        --bucket ${LifecycleBucket} \
+        --key compliance-data/q1-report.pdf \
+        --query "[StorageClass, ContentLength]"
+    Description: Manually transition an object to Glacier for testing
+
+  RestoreFromGlacierCommand:
+    Value: !Sub |
+      # Initiate Glacier restore (Standard = 3-5 hours):
+      aws s3api restore-object \
+        --bucket ${LifecycleBucket} \
+        --key compliance-data/q1-report.pdf \
+        --restore-request '{"Days":7,"GlacierJobParameters":{"Tier":"Standard"}}'
+
+      # Check restore status (look for "ongoing-request":"false" when complete):
+      aws s3api head-object \
+        --bucket ${LifecycleBucket} \
+        --key compliance-data/q1-report.pdf \
+        --query "Restore"
+    Description: Restore a Glacier object and check its status

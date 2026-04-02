@@ -1,0 +1,170 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  SAA Study Project 3.3 - Amazon Data Firehose delivery stream reading from
+  Kinesis and delivering to S3 partitioned by date. Requires kinesis-stream.yaml.
+
+Resources:
+
+  # ── IAM Role for Firehose ─────────────────────────────────────────────────
+  FirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: saa-firehose-delivery-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FirehoseAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:GetRecords
+                  - kinesis:GetShardIterator
+                  - kinesis:DescribeStream
+                  - kinesis:ListShards
+                Resource: !ImportValue SAA-Kinesis-StreamArn
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::saa-firehose-delivery-${AWS::AccountId}'
+                  - !Sub 'arn:aws:s3:::saa-firehose-delivery-${AWS::AccountId}/*'
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt TransformFunction.Arn
+              - Effect: Allow
+                Action:
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  # ── Transform Lambda (JSON → enriched JSON, or JSON → Parquet via Glue) ──
+  TransformRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  TransformFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: saa-firehose-transform
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt TransformRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import base64
+          import json
+
+          def lambda_handler(event, context):
+              """
+              Firehose transformation Lambda.
+              Enriches each record and returns it in Firehose's expected format.
+              Return: list of {'recordId': ..., 'result': 'Ok'/'Dropped'/'ProcessingFailed', 'data': base64}
+              """
+              output = []
+              for record in event['records']:
+                  try:
+                      payload = json.loads(base64.b64decode(record['data']))
+
+                      # Enrich: add processing timestamp
+                      payload['processedAt'] = context.aws_request_id
+                      payload['source'] = 'firehose-transform'
+
+                      # Re-encode as JSON line (Firehose S3 delivery)
+                      enriched = json.dumps(payload) + '\n'
+                      encoded = base64.b64encode(enriched.encode('utf-8')).decode('utf-8')
+
+                      output.append({
+                          'recordId': record['recordId'],
+                          'result': 'Ok',
+                          'data': encoded
+                      })
+                  except Exception as e:
+                      print(f"Failed to process record {record['recordId']}: {e}")
+                      output.append({
+                          'recordId': record['recordId'],
+                          'result': 'ProcessingFailed',
+                          'data': record['data']
+                      })
+              return {'records': output}
+      Tags:
+        - {Key: Project, Value: SAA-Study}
+
+  # ── Firehose Delivery Stream ──────────────────────────────────────────────
+  FirehoseDeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: saa-clickstream-delivery
+      DeliveryStreamType: KinesisStreamAsSource
+      KinesisStreamSourceConfiguration:
+        KinesisStreamARN: !ImportValue SAA-Kinesis-StreamArn
+        RoleARN: !GetAtt FirehoseRole.Arn
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !Sub 'arn:aws:s3:::saa-firehose-delivery-${AWS::AccountId}'
+        RoleARN: !GetAtt FirehoseRole.Arn
+        # Partition by date for efficient Athena queries
+        Prefix: 'clickstream/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/'
+        ErrorOutputPrefix: 'errors/!{firehose:error-output-type}/year=!{timestamp:yyyy}/month=!{timestamp:MM}/'
+        BufferingHints:
+          SizeInMBs: 5             # Deliver when buffer reaches 5 MB
+          IntervalInSeconds: 60    # Or every 60 seconds (whichever comes first)
+        CompressionFormat: GZIP    # Compress to save S3 storage
+        ProcessingConfiguration:
+          Enabled: true
+          Processors:
+            - Type: Lambda
+              Parameters:
+                - ParameterName: LambdaArn
+                  ParameterValue: !GetAtt TransformFunction.Arn
+                - ParameterName: BufferSizeInMBs
+                  ParameterValue: '1'
+                - ParameterName: BufferIntervalInSeconds
+                  ParameterValue: '60'
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: /aws/kinesisfirehose/saa-clickstream-delivery
+          LogStreamName: S3Delivery
+      Tags:
+        - {Key: Project, Value: SAA-Study}
+
+Outputs:
+  FirehoseStreamName:
+    Value: !Ref FirehoseDeliveryStream
+    Description: Firehose delivery stream name
+
+  DeliveryBucket:
+    Value: !Sub 'saa-firehose-delivery-${AWS::AccountId}'
+    Description: Check this S3 bucket after ~60 seconds of sending events
+
+  AthenaSetup:
+    Value: !Sub |
+      -- Run in Athena after data appears in S3:
+      CREATE DATABASE IF NOT EXISTS saa_analytics;
+      CREATE EXTERNAL TABLE saa_analytics.clickstream (
+        userId STRING,
+        page STRING,
+        action STRING,
+        ts STRING,
+        processedAt STRING
+      )
+      PARTITIONED BY (year STRING, month STRING, day STRING)
+      ROW FORMAT SERDE 'org.openx.data.jsonserde.JsonSerDe'
+      LOCATION 's3://saa-firehose-delivery-${AWS::AccountId}/clickstream/';
+    Description: Athena DDL to query the delivered data

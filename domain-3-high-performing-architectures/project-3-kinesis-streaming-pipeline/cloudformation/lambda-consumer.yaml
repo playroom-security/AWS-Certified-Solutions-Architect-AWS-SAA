@@ -1,0 +1,90 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  SAA Study Project 3.3 - Lambda consumer triggered by Kinesis Data Stream.
+  Requires kinesis-stream.yaml to be deployed first.
+
+Resources:
+
+  ProcessStreamFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: saa-stream-processor
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !ImportValue SAA-Kinesis-ConsumerRoleArn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import base64
+          import json
+
+          def lambda_handler(event, context):
+              processed = 0
+              for record in event['Records']:
+                  # Kinesis data is base64-encoded
+                  payload = base64.b64decode(record['kinesis']['data']).decode('utf-8')
+                  try:
+                      data = json.loads(payload)
+                  except json.JSONDecodeError:
+                      data = {'raw': payload}
+
+                  shard_id = record['eventID'].split(':')[0]
+                  seq_num  = record['kinesis']['sequenceNumber']
+
+                  print(f"[STREAM] Shard:{shard_id} | Seq:{seq_num[:10]}... | "
+                        f"User:{data.get('userId','?')} | Page:{data.get('page','?')}")
+                  processed += 1
+
+              print(f"[STREAM] Processed {processed} records from {len(set(r['eventID'].split(':')[0] for r in event['Records']))} shard(s)")
+              return {'statusCode': 200, 'processed': processed}
+      Tags:
+        - {Key: Project, Value: SAA-Study}
+
+  # Kinesis → Lambda event source mapping
+  KinesisEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !ImportValue SAA-Kinesis-StreamArn
+      FunctionName: !GetAtt ProcessStreamFunction.Arn
+      StartingPosition: LATEST        # Start reading from newest records
+      BatchSize: 100                  # Process up to 100 records per invocation
+      BisectBatchOnFunctionError: true
+      DestinationConfig:
+        OnFailure:
+          Destination: !GetAtt StreamProcessingDLQ.Arn
+
+  # SQS DLQ for failed Kinesis batches
+  StreamProcessingDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: saa-kinesis-dlq
+      MessageRetentionPeriod: 1209600
+      Tags:
+        - {Key: Project, Value: SAA-Study}
+
+  # Allow Lambda to send failures to DLQ
+  DLQAccessPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: saa-kinesis-dlq-access
+      Roles: [!ImportValue SAA-Kinesis-ConsumerRoleArn]  # attach to consumer role
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: sqs:SendMessage
+            Resource: !GetAtt StreamProcessingDLQ.Arn
+
+Outputs:
+  ProcessorFunctionArn:
+    Value: !GetAtt ProcessStreamFunction.Arn
+    Description: Lambda ARN for the Kinesis stream processor
+
+  DLQUrl:
+    Value: !Ref StreamProcessingDLQ
+    Description: Dead Letter Queue for failed Kinesis batches
+
+  ViewLogsCommand:
+    Value: !Sub |
+      aws logs tail /aws/lambda/saa-stream-processor --follow
+    Description: Watch live Lambda logs as Kinesis events are processed

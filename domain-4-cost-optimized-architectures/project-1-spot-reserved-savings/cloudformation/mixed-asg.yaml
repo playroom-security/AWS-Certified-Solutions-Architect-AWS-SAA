@@ -1,0 +1,343 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  SAA Study Project 4.1 - Mixed Instances Auto Scaling Group combining
+  On-Demand base capacity with Spot Instance overflow across multiple
+  instance types and Availability Zones for cost optimisation.
+
+Parameters:
+  OnDemandBaseCapacity:
+    Type: Number
+    Default: 2
+    Description: Number of On-Demand instances guaranteed in the base layer
+  DesiredCapacity:
+    Type: Number
+    Default: 4
+    Description: Total desired instances (base On-Demand + Spot top-up)
+  MinSize:
+    Type: Number
+    Default: 2
+  MaxSize:
+    Type: Number
+    Default: 10
+
+Resources:
+
+  # ── VPC ───────────────────────────────────────────────────────────────────
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.60.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags: [{Key: Name, Value: SAA-Spot-VPC},{Key: Project, Value: SAA-Study}]
+
+  IGW:
+    Type: AWS::EC2::InternetGateway
+  IGWAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: {VpcId: !Ref VPC, InternetGatewayId: !Ref IGW}
+
+  PubSub1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.60.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags: [{Key: Name, Value: SAA-Spot-PubSub1}]
+
+  PubSub2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.60.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags: [{Key: Name, Value: SAA-Spot-PubSub2}]
+
+  PubSub3:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.60.3.0/24
+      AvailabilityZone: !Select [2, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags: [{Key: Name, Value: SAA-Spot-PubSub3}]
+
+  PubRT:
+    Type: AWS::EC2::RouteTable
+    Properties: {VpcId: !Ref VPC}
+  PubRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IGWAttach
+    Properties: {RouteTableId: !Ref PubRT, DestinationCidrBlock: 0.0.0.0/0, GatewayId: !Ref IGW}
+  Sub1Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PubSub1, RouteTableId: !Ref PubRT}
+  Sub2Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PubSub2, RouteTableId: !Ref PubRT}
+  Sub3Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PubSub3, RouteTableId: !Ref PubRT}
+
+  # ── Security Group ────────────────────────────────────────────────────────
+  WebSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: HTTP from internet + SSM access
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0}
+      Tags: [{Key: Project, Value: SAA-Study}]
+
+  # ── IAM Role (SSM Session Manager — no SSH key needed) ───────────────────
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - {Effect: Allow, Principal: {Service: ec2.amazonaws.com}, Action: sts:AssumeRole}
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags: [{Key: Project, Value: SAA-Study}]
+
+  EC2Profile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref EC2Role]
+
+  # ── SNS Topic for Spot interruption alerts ────────────────────────────────
+  SpotAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: saa-spot-interruption-alerts
+      Tags: [{Key: Project, Value: SAA-Study}]
+
+  # ── Launch Template ────────────────────────────────────────────────────────
+  # NOTE: Instance type is NOT set here — it is set in the ASG MixedInstancesPolicy.
+  # This allows the ASG to choose from multiple instance types for Spot diversification.
+  MixedInstancesLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: SAA-MixedInstances-LT
+      LaunchTemplateData:
+        ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64}}'
+        IamInstanceProfile:
+          Arn: !GetAtt EC2Profile.Arn
+        SecurityGroupIds:
+          - !Ref WebSG
+        # Instance metadata options — use IMDSv2 (more secure)
+        MetadataOptions:
+          HttpTokens: required
+          HttpPutResponseHopLimit: 1
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            yum update -y
+            yum install -y httpd
+
+            # Detect if this is a Spot or On-Demand instance
+            TOKEN=$(curl -sX PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+            LIFECYCLE=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-life-cycle)
+            INSTANCE_TYPE=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-type)
+            AZ=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/availability-zone)
+            INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+
+            systemctl start httpd && systemctl enable httpd
+            cat > /var/www/html/index.html <<EOF
+            <html><body style="font-family:Arial;padding:20px;">
+            <h2>SAA Study - Mixed Instances ASG Demo</h2>
+            <table border="1" cellpadding="8">
+              <tr><td><b>Instance ID</b></td><td>$INSTANCE_ID</td></tr>
+              <tr><td><b>Instance Type</b></td><td>$INSTANCE_TYPE</td></tr>
+              <tr><td><b>Availability Zone</b></td><td>$AZ</td></tr>
+              <tr><td><b>Lifecycle</b></td><td style="color:$([ "$LIFECYCLE" = "spot" ] && echo "orange" || echo "green")"><b>$LIFECYCLE</b></td></tr>
+            </table>
+            <p><small>Refresh to hit a different instance in the ASG</small></p>
+            </body></html>
+            EOF
+            echo "OK" > /var/www/html/health
+
+            # Install and start Spot interruption handler as background process
+            cat > /usr/local/bin/spot-monitor.sh <<'MONITOR'
+            #!/bin/bash
+            while true; do
+              TOKEN=$(curl -sX PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
+              HTTP=$(curl -s -o /dev/null -w "%{http_code}" -H "X-aws-ec2-metadata-token: $TOKEN" \
+                http://169.254.169.254/latest/meta-data/spot/termination-time)
+              if [ "$HTTP" = "200" ]; then
+                logger "SPOT INTERRUPTION RECEIVED - starting graceful shutdown"
+                systemctl stop httpd
+                break
+              fi
+              sleep 5
+            done
+            MONITOR
+            chmod +x /usr/local/bin/spot-monitor.sh
+            nohup /usr/local/bin/spot-monitor.sh &
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - {Key: Name, Value: SAA-MixedASG-Instance}
+              - {Key: Project, Value: SAA-Study}
+          - ResourceType: volume
+            Tags:
+              - {Key: Project, Value: SAA-Study}
+
+  # ── Application Load Balancer ─────────────────────────────────────────────
+  ALBSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB - HTTP from internet
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0}
+
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: SAA-Mixed-ALB
+      Scheme: internet-facing
+      Type: application
+      Subnets: [!Ref PubSub1, !Ref PubSub2, !Ref PubSub3]
+      SecurityGroups: [!Ref ALBSG]
+      Tags: [{Key: Project, Value: SAA-Study}]
+
+  TG:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: SAA-Mixed-TG
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      TargetGroupAttributes:
+        - {Key: deregistration_delay.timeout_seconds, Value: '30'}
+      Tags: [{Key: Project, Value: SAA-Study}]
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions: [{Type: forward, TargetGroupArn: !Ref TG}]
+
+  # ── Mixed Instances Auto Scaling Group ────────────────────────────────────
+  MixedInstancesASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: SAA-Mixed-ASG
+      MinSize: !Ref MinSize
+      MaxSize: !Ref MaxSize
+      DesiredCapacity: !Ref DesiredCapacity
+      VPCZoneIdentifier: [!Ref PubSub1, !Ref PubSub2, !Ref PubSub3]
+      TargetGroupARNs: [!Ref TG]
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 90
+
+      # ── Key Section: Mixed Instances Policy ──────────────────────────────
+      MixedInstancesPolicy:
+        LaunchTemplate:
+          LaunchTemplateSpecification:
+            LaunchTemplateId: !Ref MixedInstancesLaunchTemplate
+            Version: !GetAtt MixedInstancesLaunchTemplate.LatestVersionNumber
+          # Multiple instance types for Spot pool diversification
+          # More pools = lower interruption probability
+          Overrides:
+            - InstanceType: t3.medium
+            - InstanceType: t3.large
+            - InstanceType: t3a.medium   # AMD variant — often cheaper Spot price
+            - InstanceType: m5.large
+            - InstanceType: m5a.large    # AMD variant
+
+        InstancesDistribution:
+          # On-Demand settings
+          OnDemandBaseCapacity: !Ref OnDemandBaseCapacity  # First N instances are On-Demand
+          OnDemandPercentageAboveBaseCapacity: 0           # All additional instances are Spot
+
+          # Spot settings
+          SpotAllocationStrategy: capacity-optimized
+          # capacity-optimized: AWS picks the Spot pool with the MOST available capacity
+          # This reduces interruption rate vs lowest-price strategy
+          # Alternative: "price-capacity-optimized" balances price + availability
+
+      Tags:
+        - {Key: Name,    Value: SAA-MixedASG, PropagateAtLaunch: true}
+        - {Key: Project, Value: SAA-Study,    PropagateAtLaunch: true}
+
+  # ── Target Tracking Scaling Policy ───────────────────────────────────────
+  CPUScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref MixedInstancesASG
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 60.0
+        DisableScaleIn: false
+
+  # ── EventBridge Rule: capture Spot interruption warnings ─────────────────
+  SpotInterruptionRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: saa-spot-interruption-warning
+      Description: Captures EC2 Spot Instance interruption warnings from EventBridge
+      EventPattern:
+        source:
+          - aws.ec2
+        detail-type:
+          - EC2 Spot Instance Interruption Warning
+      State: ENABLED
+      Targets:
+        - Arn: !Ref SpotAlertTopic
+          Id: SpotAlertSNS
+
+  SpotAlertPermission:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref SpotAlertTopic]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref SpotAlertTopic
+
+Outputs:
+  ALBDNSName:
+    Value: !GetAtt ALB.DNSName
+    Description: >
+      Open in browser and keep refreshing - instances show their lifecycle
+      (spot or normal) and instance type so you can see the mix in action.
+
+  ASGName:
+    Value: !Ref MixedInstancesASG
+    Description: Auto Scaling Group name
+
+  SpotAlertTopicArn:
+    Value: !Ref SpotAlertTopic
+    Description: Subscribe your email here to receive Spot interruption alerts
+
+  SubscribeEmailCommand:
+    Value: !Sub |
+      aws sns subscribe \
+        --topic-arn ${SpotAlertTopic} \
+        --protocol email \
+        --notification-endpoint your@email.com
+    Description: Subscribe to Spot interruption alerts
+
+  CheckInstanceTypesCommand:
+    Value: !Sub |
+      aws autoscaling describe-auto-scaling-instances \
+        --query "AutoScalingInstances[?AutoScalingGroupName=='${MixedInstancesASG}'].[InstanceId,InstanceType,LifecycleState]" \
+        --output table
+    Description: See which instance types and lifecycle (Spot/On-Demand) are running

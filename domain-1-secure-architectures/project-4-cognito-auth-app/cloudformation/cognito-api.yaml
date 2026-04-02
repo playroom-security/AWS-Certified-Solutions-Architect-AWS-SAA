@@ -1,0 +1,304 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  SAA Study Project 1.4 - Cognito User Pool + Identity Pool +
+  API Gateway with Cognito Authorizer + Lambda backend functions.
+
+Resources:
+
+  # ── Cognito User Pool ─────────────────────────────────────────────────────
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: saa-study-user-pool
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireNumbers: true
+          RequireSymbols: true
+          RequireUppercase: true
+          RequireLowercase: true
+      MfaConfiguration: OPTIONAL
+      UserPoolTags:
+        Project: SAA-Study
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: saa-web-app
+      UserPoolId: !Ref UserPool
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_SRP_AUTH
+      GenerateSecret: false         # No secret for browser/mobile apps
+      AccessTokenValidity: 1        # hours
+      IdTokenValidity: 1
+      RefreshTokenValidity: 30      # days
+      PreventUserExistenceErrors: ENABLED
+
+  AdminGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: Admins
+      Description: Administrator users with elevated API access
+      UserPoolId: !Ref UserPool
+
+  UsersGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: Users
+      Description: Standard users
+      UserPoolId: !Ref UserPool
+
+  # ── Cognito Identity Pool ─────────────────────────────────────────────────
+  IdentityPool:
+    Type: AWS::Cognito::IdentityPool
+    Properties:
+      IdentityPoolName: saa_study_identity_pool
+      AllowUnauthenticatedIdentities: false
+      CognitoIdentityProviders:
+        - ClientId: !Ref UserPoolClient
+          ProviderName: !GetAtt UserPool.ProviderName
+
+  # IAM roles for authenticated/unauthenticated identities
+  AuthenticatedRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: CognitoAuthenticatedRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: cognito-identity.amazonaws.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                cognito-identity.amazonaws.com:aud: !Ref IdentityPool
+              ForAnyValue:StringLike:
+                cognito-identity.amazonaws.com:amr: authenticated
+      Policies:
+        - PolicyName: AuthenticatedPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub 'arn:aws:s3:::saa-user-uploads-${AWS::AccountId}/private/${!cognito-identity.amazonaws.com:sub}/*'
+
+  UnauthenticatedRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: CognitoUnauthenticatedRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: cognito-identity.amazonaws.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                cognito-identity.amazonaws.com:aud: !Ref IdentityPool
+              ForAnyValue:StringLike:
+                cognito-identity.amazonaws.com:amr: unauthenticated
+      Policies:
+        - PolicyName: UnauthenticatedPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: arn:aws:s3:::saa-public-assets/*
+
+  IdentityPoolRoleAttachment:
+    Type: AWS::Cognito::IdentityPoolRoleAttachment
+    Properties:
+      IdentityPoolId: !Ref IdentityPool
+      Roles:
+        authenticated: !GetAtt AuthenticatedRole.Arn
+        unauthenticated: !GetAtt UnauthenticatedRole.Arn
+
+  # ── Lambda Execution Role ─────────────────────────────────────────────────
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  # ── Lambda Functions ──────────────────────────────────────────────────────
+  GetProfileFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: saa-get-profile
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          def handler(event, context):
+              claims = event.get('requestContext', {}).get('authorizer', {}).get('jwt', {}).get('claims', {})
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'user_id': claims.get('sub', 'unknown'),
+                      'email': claims.get('email', 'unknown'),
+                      'groups': claims.get('cognito:groups', []),
+                      'message': 'Profile retrieved successfully'
+                  })
+              }
+      Tags:
+        - Key: Project
+          Value: SAA-Study
+
+  AdminOnlyFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: saa-admin-only
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          def handler(event, context):
+              claims = event.get('requestContext', {}).get('authorizer', {}).get('jwt', {}).get('claims', {})
+              groups = claims.get('cognito:groups', '')
+              if 'Admins' not in (groups if isinstance(groups, list) else groups.split(',')):
+                  return {'statusCode': 403, 'body': json.dumps({'error': 'Admin access required'})}
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({'message': 'Welcome, Admin!', 'email': claims.get('email')})
+              }
+      Tags:
+        - Key: Project
+          Value: SAA-Study
+
+  # ── API Gateway (HTTP API - cheaper than REST API) ────────────────────────
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: saa-cognito-api
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins:
+          - '*'
+        AllowMethods:
+          - GET
+          - POST
+        AllowHeaders:
+          - Authorization
+          - Content-Type
+
+  # Cognito JWT Authorizer
+  CognitoAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref HttpApi
+      AuthorizerType: JWT
+      Name: CognitoJWTAuthorizer
+      IdentitySource:
+        - '$request.header.Authorization'
+      JwtConfiguration:
+        Audience:
+          - !Ref UserPoolClient
+        Issuer: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}'
+
+  # Lambda integrations
+  GetProfileIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt GetProfileFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  AdminIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt AdminOnlyFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  # Routes (protected by Cognito JWT authorizer)
+  GetProfileRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: GET /profile
+      AuthorizationType: JWT
+      AuthorizerId: !Ref CognitoAuthorizer
+      Target: !Sub 'integrations/${GetProfileIntegration}'
+
+  AdminRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: GET /admin
+      AuthorizationType: JWT
+      AuthorizerId: !Ref CognitoAuthorizer
+      Target: !Sub 'integrations/${AdminIntegration}'
+
+  # Default stage with auto-deploy
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: prod
+      AutoDeploy: true
+
+  # Allow API Gateway to invoke Lambda functions
+  GetProfilePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GetProfileFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*/profile'
+
+  AdminPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AdminOnlyFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*/admin'
+
+Outputs:
+  UserPoolId:
+    Value: !Ref UserPool
+    Description: Cognito User Pool ID (needed for CLI commands in README)
+
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+    Description: App client ID (needed for auth commands)
+
+  IdentityPoolId:
+    Value: !Ref IdentityPool
+    Description: Identity Pool ID
+
+  ApiEndpoint:
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/prod'
+    Description: API Gateway endpoint URL
+
+  TestProfileCommand:
+    Value: !Sub |
+      # 1. Sign up: aws cognito-idp sign-up --client-id ${UserPoolClient} --username you@email.com --password Test@12345
+      # 2. Confirm: aws cognito-idp admin-confirm-sign-up --user-pool-id ${UserPool} --username you@email.com
+      # 3. Sign in to get token, then: curl -H "Authorization: Bearer ID_TOKEN" https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/prod/profile
+    Description: Quick start commands

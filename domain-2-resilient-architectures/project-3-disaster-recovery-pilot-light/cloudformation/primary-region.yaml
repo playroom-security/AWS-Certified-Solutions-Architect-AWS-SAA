@@ -1,0 +1,263 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  SAA Study Project 2.3 - PRIMARY REGION stack (us-east-1).
+  Full production workload: VPC, EC2 ASG, ALB, RDS MySQL.
+  Deploy this first, then deploy dr-region.yaml in us-west-2.
+
+Parameters:
+  DBPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    Default: SAAstudy123!
+  InstanceType:
+    Type: String
+    Default: t3.micro
+
+Resources:
+
+  # ── VPC ───────────────────────────────────────────────────────────────────
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.10.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags: [{Key: Name, Value: SAA-Primary-VPC},{Key: Project, Value: SAA-Study}]
+
+  IGW:
+    Type: AWS::EC2::InternetGateway
+  IGWAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: {VpcId: !Ref VPC, InternetGatewayId: !Ref IGW}
+
+  PubSub1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.10.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+  PubSub2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.10.3.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+  PrivSub1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.10.2.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+  PrivSub2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.10.4.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+
+  NatEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: IGWAttach
+    Properties: {Domain: vpc}
+  NatGW:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEIP.AllocationId
+      SubnetId: !Ref PubSub1
+
+  PubRT:
+    Type: AWS::EC2::RouteTable
+    Properties: {VpcId: !Ref VPC}
+  PubRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IGWAttach
+    Properties: {RouteTableId: !Ref PubRT, DestinationCidrBlock: 0.0.0.0/0, GatewayId: !Ref IGW}
+  PubSub1RTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PubSub1, RouteTableId: !Ref PubRT}
+  PubSub2RTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PubSub2, RouteTableId: !Ref PubRT}
+  PrivRT:
+    Type: AWS::EC2::RouteTable
+    Properties: {VpcId: !Ref VPC}
+  PrivRoute:
+    Type: AWS::EC2::Route
+    Properties: {RouteTableId: !Ref PrivRT, DestinationCidrBlock: 0.0.0.0/0, NatGatewayId: !Ref NatGW}
+  PrivSub1RTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PrivSub1, RouteTableId: !Ref PrivRT}
+  PrivSub2RTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PrivSub2, RouteTableId: !Ref PrivRT}
+
+  # ── Security Groups ───────────────────────────────────────────────────────
+  ALBSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB public access
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0}
+  WebSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Web servers - HTTP from ALB only
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 80, ToPort: 80, SourceSecurityGroupId: !Ref ALBSG}
+  DBSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS MySQL from web tier
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 3306, ToPort: 3306, SourceSecurityGroupId: !Ref WebSG}
+
+  # ── EC2 IAM Role ──────────────────────────────────────────────────────────
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - {Effect: Allow, Principal: {Service: ec2.amazonaws.com}, Action: sts:AssumeRole}
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+  EC2Profile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: {Roles: [!Ref EC2Role]}
+
+  # ── Launch Template + ASG ─────────────────────────────────────────────────
+  LT:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: SAA-Primary-LT
+      LaunchTemplateData:
+        ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64}}'
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile: {Arn: !GetAtt EC2Profile.Arn}
+        SecurityGroupIds: [!Ref WebSG]
+        UserData:
+          Fn::Base64: |
+            #!/bin/bash
+            yum install -y httpd && systemctl start httpd && systemctl enable httpd
+            AZ=$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone)
+            echo "<h1>PRIMARY REGION (us-east-1)</h1><p>AZ: $AZ</p>" > /var/www/html/index.html
+            echo "OK" > /var/www/html/health
+        TagSpecifications:
+          - ResourceType: instance
+            Tags: [{Key: Name, Value: SAA-Primary-Web},{Key: Project, Value: SAA-Study}]
+
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: SAA-Primary-ALB
+      Scheme: internet-facing
+      Type: application
+      Subnets: [!Ref PubSub1, !Ref PubSub2]
+      SecurityGroups: [!Ref ALBSG]
+
+  TG:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: SAA-Primary-TG
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 15
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions: [{Type: forward, TargetGroupArn: !Ref TG}]
+
+  ASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: SAA-Primary-ASG
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LT
+        Version: !GetAtt LT.LatestVersionNumber
+      MinSize: '2'
+      MaxSize: '4'
+      DesiredCapacity: '2'
+      VPCZoneIdentifier: [!Ref PrivSub1, !Ref PrivSub2]
+      TargetGroupARNs: [!Ref TG]
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 90
+
+  # ── RDS MySQL (primary — will create a read replica in dr-region.yaml) ───
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Primary RDS subnets
+      SubnetIds: [!Ref PrivSub1, !Ref PrivSub2]
+
+  RDS:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    Properties:
+      DBInstanceIdentifier: saa-primary-mysql
+      DBInstanceClass: db.t3.micro
+      Engine: mysql
+      EngineVersion: '8.0'
+      MasterUsername: admin
+      MasterUserPassword: !Ref DBPassword
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups: [!Ref DBSG]
+      AllocatedStorage: '20'
+      StorageType: gp3
+      MultiAZ: false
+      BackupRetentionPeriod: 7       # Required for read replica creation
+      PubliclyAccessible: false
+      DeletionProtection: false
+      Tags: [{Key: Project, Value: SAA-Study}]
+
+  # ── Route 53 Health Check for primary ALB ────────────────────────────────
+  PrimaryHealthCheck:
+    Type: AWS::Route53::HealthCheck
+    Properties:
+      HealthCheckConfig:
+        Type: HTTP
+        ResourcePath: /health
+        FullyQualifiedDomainName: !GetAtt ALB.DNSName
+        Port: 80
+        RequestInterval: 30
+        FailureThreshold: 3
+      HealthCheckTags:
+        - {Key: Name, Value: SAA-Primary-HealthCheck}
+        - {Key: Project, Value: SAA-Study}
+
+Outputs:
+  ALBDNSName:
+    Value: !GetAtt ALB.DNSName
+    Description: Primary ALB DNS name
+
+  RDSInstanceId:
+    Value: !Ref RDS
+    Description: RDS instance ID - needed to create cross-region read replica
+
+  RDSEndpoint:
+    Value: !GetAtt RDS.Endpoint.Address
+    Description: Primary RDS endpoint
+
+  HealthCheckId:
+    Value: !Ref PrimaryHealthCheck
+    Description: Route 53 health check ID - use in failover DNS records
+
+  CreateReplicaCommand:
+    Value: !Sub |
+      aws rds create-db-instance-read-replica \
+        --db-instance-identifier saa-dr-replica \
+        --source-db-instance-identifier arn:aws:rds:us-east-1:${AWS::AccountId}:db:saa-primary-mysql \
+        --db-instance-class db.t3.micro \
+        --region us-west-2
+    Description: Run this after stack is up to create the DR read replica

@@ -1,0 +1,151 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  SAA Study Project 1.3 - KMS Customer Managed Key with key policy,
+  automatic rotation enabled, and an S3 bucket enforcing SSE-KMS.
+
+Parameters:
+  AdminRoleArn:
+    Type: String
+    Description: ARN of the IAM user/role that will administer the KMS key
+    Default: ""
+  AppRoleName:
+    Type: String
+    Description: Name of the IAM role that will use the key for encrypt/decrypt
+    Default: AppRole
+
+Resources:
+
+  # ── IAM Role for application use of the key ────────────────────────────────
+  AppRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref AppRoleName
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Tags:
+        - Key: Project
+          Value: SAA-Study
+
+  # ── KMS Customer Managed Key ──────────────────────────────────────────────
+  AppEncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: SAA Study - Application encryption key (SSE-KMS for S3 and RDS)
+      EnableKeyRotation: true        # Automatic annual rotation
+      KeyUsage: ENCRYPT_DECRYPT
+      KeySpec: SYMMETRIC_DEFAULT
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          # Allow the account root full control (required)
+          - Sid: AllowRootFullControl
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+
+          # Allow AppRole to use the key for encrypt/decrypt
+          - Sid: AllowAppRoleUsage
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt AppRole.Arn
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+
+          # Allow S3 service to use the key for SSE-KMS
+          - Sid: AllowS3ServiceUsage
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action:
+              - kms:GenerateDataKey
+              - kms:Decrypt
+            Resource: '*'
+      Tags:
+        - Key: Project
+          Value: SAA-Study
+        - Key: Domain
+          Value: Domain1-Security
+
+  AppEncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/saa-study-app-key
+      TargetKeyId: !Ref AppEncryptionKey
+
+  # ── S3 Bucket with SSE-KMS default encryption ────────────────────────────
+  EncryptedBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'saa-kms-demo-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref AppEncryptionKey
+            BucketKeyEnabled: true    # Reduces KMS API calls (cost saving)
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: SAA-Study
+
+  # Bucket policy: deny any upload that does NOT use SSE-KMS
+  EncryptedBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref EncryptedBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyUnencryptedUploads
+            Effect: Deny
+            Principal: '*'
+            Action: s3:PutObject
+            Resource: !Sub '${EncryptedBucket.Arn}/*'
+            Condition:
+              StringNotEquals:
+                s3:x-amz-server-side-encryption: aws:kms
+          - Sid: DenyWrongKMSKey
+            Effect: Deny
+            Principal: '*'
+            Action: s3:PutObject
+            Resource: !Sub '${EncryptedBucket.Arn}/*'
+            Condition:
+              StringNotEquals:
+                s3:x-amz-server-side-encryption-aws-kms-key-id: !GetAtt AppEncryptionKey.Arn
+
+Outputs:
+  KMSKeyArn:
+    Value: !GetAtt AppEncryptionKey.Arn
+    Description: KMS Key ARN
+    Export:
+      Name: SAA-KMS-Key-Arn
+
+  KMSKeyAlias:
+    Value: !Ref AppEncryptionKeyAlias
+    Description: KMS Key alias
+
+  EncryptedBucketName:
+    Value: !Ref EncryptedBucket
+    Description: S3 bucket with SSE-KMS enforced
+
+  AppRoleArn:
+    Value: !GetAtt AppRole.Arn
+    Description: IAM role permitted to use the KMS key

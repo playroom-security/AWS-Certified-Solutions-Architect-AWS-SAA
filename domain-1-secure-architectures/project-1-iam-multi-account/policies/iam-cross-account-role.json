@@ -1,0 +1,52 @@
+{
+  "_comment": "Deploy this in the MEMBER (Dev) account. Replace MANAGEMENT_ACCOUNT_ID with your actual account ID.",
+
+  "TrustPolicy": {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Effect": "Allow",
+        "Principal": {
+          "AWS": "arn:aws:iam::MANAGEMENT_ACCOUNT_ID:root"
+        },
+        "Action": "sts:AssumeRole",
+        "Condition": {
+          "Bool": {
+            "aws:MultiFactorAuthPresent": "true"
+          }
+        }
+      }
+    ]
+  },
+
+  "PermissionPolicy": {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "ReadOnlyDevAccess",
+        "Effect": "Allow",
+        "Action": [
+          "ec2:Describe*",
+          "s3:Get*",
+          "s3:List*",
+          "cloudwatch:Get*",
+          "cloudwatch:List*",
+          "cloudwatch:Describe*"
+        ],
+        "Resource": "*"
+      }
+    ]
+  },
+
+  "AssumeRolePolicyForManagementAccount": {
+    "_comment": "Attach this to the IAM user/group in the Management account",
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Effect": "Allow",
+        "Action": "sts:AssumeRole",
+        "Resource": "arn:aws:iam::DEV_ACCOUNT_ID:role/DevCrossAccountRole"
+      }
+    ]
+  }
+}

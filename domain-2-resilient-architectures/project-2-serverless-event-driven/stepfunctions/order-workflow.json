@@ -1,0 +1,110 @@
+{
+  "Comment": "SAA Study Project 2.2 - Order Fulfillment Workflow",
+  "StartAt": "ValidateOrder",
+  "States": {
+
+    "ValidateOrder": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:ACCOUNT_ID:function:ValidateOrder",
+      "Comment": "Validate order fields and customer eligibility",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["OrderValidationError"],
+          "Next": "OrderRejected",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "ChargePayment"
+    },
+
+    "ChargePayment": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:ACCOUNT_ID:function:ChargePayment",
+      "Comment": "Charge customer payment method",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.Timeout"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 2,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["PaymentDeclinedError"],
+          "Next": "NotifyPaymentFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "TimeoutSeconds": 10,
+      "Next": "FulfillmentParallel"
+    },
+
+    "FulfillmentParallel": {
+      "Type": "Parallel",
+      "Comment": "Run inventory update and confirmation email in parallel",
+      "Branches": [
+        {
+          "StartAt": "UpdateInventory",
+          "States": {
+            "UpdateInventory": {
+              "Type": "Task",
+              "Resource": "arn:aws:lambda:us-east-1:ACCOUNT_ID:function:UpdateInventory",
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "SendConfirmationEmail",
+          "States": {
+            "SendConfirmationEmail": {
+              "Type": "Task",
+              "Resource": "arn:aws:lambda:us-east-1:ACCOUNT_ID:function:SendEmail",
+              "End": true
+            }
+          }
+        }
+      ],
+      "Next": "OrderComplete"
+    },
+
+    "OrderComplete": {
+      "Type": "Succeed",
+      "Comment": "Order successfully fulfilled"
+    },
+
+    "OrderRejected": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:ACCOUNT_ID:function:SendEmail",
+      "Parameters": {
+        "emailType": "ORDER_REJECTED",
+        "order.$": "$"
+      },
+      "Next": "OrderFailed"
+    },
+
+    "NotifyPaymentFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:ACCOUNT_ID:function:SendEmail",
+      "Parameters": {
+        "emailType": "PAYMENT_FAILED",
+        "order.$": "$"
+      },
+      "Next": "OrderFailed"
+    },
+
+    "OrderFailed": {
+      "Type": "Fail",
+      "Error": "OrderFulfillmentFailed",
+      "Cause": "Order could not be fulfilled. See previous states for details."
+    }
+  }
+}

@@ -1,0 +1,272 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  SAA Study Project 4.4 - Serverless thumbnail generator using Lambda + API Gateway HTTP API.
+  Deploy alongside ec2-api.yaml to compare cost at different request volumes.
+  Includes a VPC Gateway Endpoint for S3 to eliminate NAT Gateway costs.
+
+Parameters:
+  LambdaMemorySize:
+    Type: Number
+    Default: 512
+    AllowedValues: [128, 256, 512, 1024, 2048]
+    Description: >
+      Lambda memory (also controls CPU). Experiment with different values
+      and compare cost vs execution time. See docs/memory-tuning-results.md.
+
+Resources:
+
+  # ── Reuse S3 bucket from ec2-api.yaml (or create standalone one) ─────────
+  # If running this stack independently (without ec2-api.yaml), uncomment:
+  # ThumbnailBucket:
+  #   Type: AWS::S3::Bucket
+  #   Properties:
+  #     BucketName: !Sub 'saa-thumbnails-${AWS::AccountId}'
+
+  # ── Lambda Execution Role ─────────────────────────────────────────────────
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: saa-serverless-thumbnail-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: S3ThumbnailAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:PutObject, s3:GetObject]
+                Resource: !Sub 'arn:aws:s3:::saa-thumbnails-${AWS::AccountId}/*'
+
+  # ── VPC for Lambda (demonstrates VPC Endpoint vs NAT Gateway cost) ────────
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.80.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags: [{Key: Name, Value: SAA-Serverless-VPC},{Key: Project, Value: SAA-Study}]
+
+  PrivSub1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.80.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+  PrivSub2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.80.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+
+  PrivRT:
+    Type: AWS::EC2::RouteTable
+    Properties: {VpcId: !Ref VPC}
+  PrivSub1Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PrivSub1, RouteTableId: !Ref PrivRT}
+  PrivSub2Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PrivSub2, RouteTableId: !Ref PrivRT}
+
+  LambdaSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Lambda function security group
+      VpcId: !Ref VPC
+
+  # ── S3 VPC Gateway Endpoint ───────────────────────────────────────────────
+  # KEY COST LESSON: Without this endpoint, Lambda-in-VPC → S3 requires a
+  # NAT Gateway costing ~$32/month just in hourly charges.
+  # This Gateway Endpoint is FREE and routes S3 traffic privately.
+  S3VPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      RouteTableIds: [!Ref PrivRT]
+      # No hourly charge, no per-GB charge — always add this when Lambda needs S3!
+
+  # ── Lambda Function ────────────────────────────────────────────────────────
+  ThumbnailFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: saa-serverless-thumbnail
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: 30
+      Environment:
+        Variables:
+          BUCKET_NAME: !Sub 'saa-thumbnails-${AWS::AccountId}'
+      # Lambda runs in VPC to demonstrate S3 VPC Endpoint
+      VpcConfig:
+        SubnetIds: [!Ref PrivSub1, !Ref PrivSub2]
+        SecurityGroupIds: [!Ref LambdaSG]
+      Code:
+        ZipFile: |
+          import boto3, io, json, os, uuid, urllib.request, time
+          from PIL import Image   # Note: Pillow must be in a Lambda Layer in production
+
+          s3 = boto3.client('s3')
+          BUCKET = os.environ['BUCKET_NAME']
+
+          def lambda_handler(event, context):
+              start = time.time()
+
+              body = json.loads(event.get('body') or '{}')
+              image_url = body.get('image_url')
+
+              if not image_url:
+                  return {'statusCode': 400,
+                          'body': json.dumps({'error': 'image_url required'})}
+
+              # Download image
+              with urllib.request.urlopen(image_url) as response:
+                  image_data = response.read()
+
+              # Resize
+              image = Image.open(io.BytesIO(image_data))
+              image.thumbnail((300, 300))
+              buf = io.BytesIO()
+              image.save(buf, format='JPEG')
+              buf.seek(0)
+
+              # Upload to S3 via VPC Gateway Endpoint (FREE — no NAT Gateway needed)
+              key = f'thumbnails/{context.aws_request_id}.jpg'
+              s3.put_object(Bucket=BUCKET, Key=key, Body=buf, ContentType='image/jpeg')
+
+              duration_ms = round((time.time() - start) * 1000)
+              memory_mb   = int(os.environ.get('AWS_LAMBDA_FUNCTION_MEMORY_SIZE', 512))
+
+              # Cost calculation for this single invocation
+              gb_seconds = (duration_ms / 1000) * (memory_mb / 1024)
+              invocation_cost = 0.0000002
+              duration_cost   = gb_seconds * 0.0000166667
+              total_cost_usd  = invocation_cost + duration_cost
+
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'thumbnail_url': f's3://{BUCKET}/{key}',
+                      'duration_ms': duration_ms,
+                      'memory_mb': memory_mb,
+                      'gb_seconds': round(gb_seconds, 6),
+                      'cost_this_invocation_usd': round(total_cost_usd, 8),
+                      'compute': f'Lambda {memory_mb}MB (pay-per-use)'
+                  })
+              }
+      Tags:
+        - {Key: Project, Value: SAA-Study}
+        - {Key: Version, Value: Serverless}
+
+  # ── CloudWatch Log Group ──────────────────────────────────────────────────
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/saa-serverless-thumbnail
+      RetentionInDays: 7
+
+  # ── API Gateway HTTP API (65% cheaper than REST API) ─────────────────────
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: saa-serverless-thumbnail-api
+      ProtocolType: HTTP
+      Description: >
+        Serverless thumbnail API using HTTP API (cheaper than REST API).
+        HTTP API: $1.00/million requests vs REST API: $3.50/million.
+      CorsConfiguration:
+        AllowOrigins: ['*']
+        AllowMethods: [POST, GET]
+        AllowHeaders: [Content-Type]
+
+  LambdaIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ThumbnailFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  ThumbnailRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: POST /thumbnail
+      Target: !Sub 'integrations/${LambdaIntegration}'
+
+  HealthRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: GET /health
+      Target: !Sub 'integrations/${LambdaIntegration}'
+
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: prod
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 100
+        ThrottlingRateLimit: 50
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ThumbnailFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*'
+
+Outputs:
+  ApiEndpoint:
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/prod'
+    Description: Serverless API endpoint
+
+  LambdaFunctionName:
+    Value: !Ref ThumbnailFunction
+    Description: Lambda function name — update memory size to tune cost vs performance
+
+  CostComparison:
+    Value: >
+      SERVERLESS: $0.0000002/request + $0.0000166667/GB-second.
+      First 1M requests and 400,000 GB-seconds FREE every month (forever).
+      At 10,000 req/day with 512MB/500ms: ~$1.20/month.
+      EC2 (t3.small): ~$15/month regardless of traffic volume.
+
+  TestCommand:
+    Value: !Sub |
+      curl -X POST https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/prod/thumbnail \
+        -H "Content-Type: application/json" \
+        -d '{"image_url":"https://picsum.photos/800/600"}'
+    Description: Send a test request — response includes cost per invocation
+
+  TuneMemoryCommand:
+    Value: !Sub |
+      # Change memory size and re-test to find optimal cost/performance:
+      aws lambda update-function-configuration \
+        --function-name ${ThumbnailFunction} \
+        --memory-size 1024
+
+      # Then re-run the test and compare duration_ms and cost_this_invocation_usd
+    Description: Experiment with Lambda memory to find the cost-optimal configuration
+
+  VPCEndpointNote:
+    Value: >
+      An S3 VPC Gateway Endpoint is deployed in this stack.
+      Lambda accesses S3 through this endpoint (FREE) instead of a NAT Gateway (~$32/month).
+      Run scripts/nat-cost-calculator.py to see how much this saves annually.

@@ -1,0 +1,192 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  SAA Study Project 1.2 - EC2 Web Servers in private subnets with ALB.
+  Requires the vpc-secure.yaml stack to be deployed first (imports VPC outputs).
+
+Parameters:
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 Key Pair for SSH (optional – use Session Manager instead)
+    Default: ""
+  InstanceType:
+    Type: String
+    Default: t3.micro
+
+Resources:
+
+  # ── Security Groups ───────────────────────────────────────────────────────
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP/HTTPS from internet to ALB
+      VpcId: !ImportValue SAA-VPC-Id
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: SAA-ALB-SG
+        - Key: Project
+          Value: SAA-Study
+
+  WebServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP only from ALB security group
+      VpcId: !ImportValue SAA-VPC-Id
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: SAA-Web-SG
+        - Key: Project
+          Value: SAA-Study
+
+  # ── IAM Role for EC2 (Session Manager access) ─────────────────────────────
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Project
+          Value: SAA-Study
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2InstanceRole
+
+  # ── Launch Template ────────────────────────────────────────────────────────
+  WebServerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: SAA-WebServer-LT
+      LaunchTemplateData:
+        ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64}}'
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt EC2InstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref WebServerSecurityGroup
+        UserData:
+          Fn::Base64: |
+            #!/bin/bash
+            yum update -y
+            yum install -y httpd
+            systemctl start httpd
+            systemctl enable httpd
+            AZ=$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone)
+            INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+            echo "<h1>Hello from AZ: $AZ</h1><p>Instance: $INSTANCE_ID</p>" > /var/www/html/index.html
+            echo "OK" > /var/www/html/health
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: SAA-WebServer
+              - Key: Project
+                Value: SAA-Study
+
+  # ── Application Load Balancer ──────────────────────────────────────────────
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: SAA-WebApp-ALB
+      Scheme: internet-facing
+      Type: application
+      Subnets:
+        - !ImportValue SAA-PublicSubnet1-Id
+        - !ImportValue SAA-PublicSubnet2-Id
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Tags:
+        - Key: Project
+          Value: SAA-Study
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: SAA-WebApp-TG
+      Port: 80
+      Protocol: HTTP
+      VpcId: !ImportValue SAA-VPC-Id
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+      Tags:
+        - Key: Project
+          Value: SAA-Study
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # ── Auto Scaling Group ────────────────────────────────────────────────────
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: SAA-WebApp-ASG
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WebServerLaunchTemplate
+        Version: !GetAtt WebServerLaunchTemplate.LatestVersionNumber
+      MinSize: '2'
+      MaxSize: '4'
+      DesiredCapacity: '2'
+      VPCZoneIdentifier:
+        - !ImportValue SAA-PrivateSubnet1-Id
+        - !ImportValue SAA-PrivateSubnet2-Id
+      TargetGroupARNs:
+        - !Ref TargetGroup
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 60
+      Tags:
+        - Key: Name
+          Value: SAA-WebServer
+          PropagateAtLaunch: true
+        - Key: Project
+          Value: SAA-Study
+          PropagateAtLaunch: true
+
+Outputs:
+  ALBDNSName:
+    Value: !GetAtt ALB.DNSName
+    Description: ALB public DNS - open in browser to test
+
+  ALBArn:
+    Value: !Ref ALB
+    Description: ALB ARN - needed for waf-web-acl.yaml parameter
+    Export:
+      Name: SAA-ALB-Arn
+
+  TargetGroupArn:
+    Value: !Ref TargetGroup
+    Export:
+      Name: SAA-TG-Arn

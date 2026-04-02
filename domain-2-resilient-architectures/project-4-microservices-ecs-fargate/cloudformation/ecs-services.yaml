@@ -1,0 +1,254 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  SAA Study Project 2.4 - ECS Fargate Services with ALB path-based routing.
+  Requires task-definitions.yaml and a VPC with public/private subnets.
+  Deploys its own networking for simplicity.
+
+Resources:
+
+  # ── VPC + Subnets ─────────────────────────────────────────────────────────
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.30.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags: [{Key: Name, Value: SAA-ECS-VPC},{Key: Project, Value: SAA-Study}]
+
+  IGW:
+    Type: AWS::EC2::InternetGateway
+  IGWAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: {VpcId: !Ref VPC, InternetGatewayId: !Ref IGW}
+
+  PubSub1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.30.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+  PubSub2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.30.3.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+
+  PubRT:
+    Type: AWS::EC2::RouteTable
+    Properties: {VpcId: !Ref VPC}
+  PubRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IGWAttach
+    Properties: {RouteTableId: !Ref PubRT, DestinationCidrBlock: 0.0.0.0/0, GatewayId: !Ref IGW}
+  PubSub1Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PubSub1, RouteTableId: !Ref PubRT}
+  PubSub2Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PubSub2, RouteTableId: !Ref PubRT}
+
+  # ── Security Groups ───────────────────────────────────────────────────────
+  ALBSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB - HTTP from internet
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0}
+
+  ECSTaskSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ECS Tasks - allow port 3000 from ALB
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 3000, ToPort: 3000, SourceSecurityGroupId: !Ref ALBSG}
+
+  # ── ALB + Target Groups ───────────────────────────────────────────────────
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: saa-microservices-alb
+      Scheme: internet-facing
+      Type: application
+      Subnets: [!Ref PubSub1, !Ref PubSub2]
+      SecurityGroups: [!Ref ALBSG]
+
+  UsersTG:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: saa-users-tg
+      Port: 3000
+      Protocol: HTTP
+      TargetType: ip              # Required for Fargate (awsvpc network mode)
+      VpcId: !Ref VPC
+      HealthCheckPath: /users/health
+      HealthCheckIntervalSeconds: 30
+
+  ProductsTG:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: saa-products-tg
+      Port: 3000
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !Ref VPC
+      HealthCheckPath: /products/health
+      HealthCheckIntervalSeconds: 30
+
+  OrdersTG:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: saa-orders-tg
+      Port: 3000
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !Ref VPC
+      HealthCheckPath: /orders/health
+      HealthCheckIntervalSeconds: 30
+
+  # ALB listener with path-based routing rules
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: fixed-response
+          FixedResponseConfig:
+            StatusCode: '404'
+            MessageBody: 'Route not found'
+
+  UsersRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref ALBListener
+      Priority: 10
+      Conditions:
+        - Field: path-pattern
+          Values: ['/users*']
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref UsersTG
+
+  ProductsRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref ALBListener
+      Priority: 20
+      Conditions:
+        - Field: path-pattern
+          Values: ['/products*']
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref ProductsTG
+
+  OrdersRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref ALBListener
+      Priority: 30
+      Conditions:
+        - Field: path-pattern
+          Values: ['/orders*']
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref OrdersTG
+
+  # ── ECS Fargate Services ──────────────────────────────────────────────────
+  UsersService:
+    Type: AWS::ECS::Service
+    DependsOn: UsersRule
+    Properties:
+      ServiceName: saa-users-service
+      Cluster: !ImportValue SAA-ECS-ClusterArn
+      TaskDefinition: !ImportValue SAA-ECS-UsersTaskDef
+      LaunchType: FARGATE
+      DesiredCount: 2
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED    # Needed if no NAT GW (lab simplification)
+          Subnets: [!Ref PubSub1, !Ref PubSub2]
+          SecurityGroups: [!Ref ECSTaskSG]
+      LoadBalancers:
+        - ContainerName: users-service
+          ContainerPort: 3000
+          TargetGroupArn: !Ref UsersTG
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 50
+        MaximumPercent: 200
+
+  ProductsService:
+    Type: AWS::ECS::Service
+    DependsOn: ProductsRule
+    Properties:
+      ServiceName: saa-products-service
+      Cluster: !ImportValue SAA-ECS-ClusterArn
+      TaskDefinition: !ImportValue SAA-ECS-ProductsTaskDef
+      LaunchType: FARGATE
+      DesiredCount: 2
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: [!Ref PubSub1, !Ref PubSub2]
+          SecurityGroups: [!Ref ECSTaskSG]
+      LoadBalancers:
+        - ContainerName: products-service
+          ContainerPort: 3000
+          TargetGroupArn: !Ref ProductsTG
+
+  OrdersService:
+    Type: AWS::ECS::Service
+    DependsOn: OrdersRule
+    Properties:
+      ServiceName: saa-orders-service
+      Cluster: !ImportValue SAA-ECS-ClusterArn
+      TaskDefinition: !ImportValue SAA-ECS-OrdersTaskDef
+      LaunchType: FARGATE
+      DesiredCount: 2
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: [!Ref PubSub1, !Ref PubSub2]
+          SecurityGroups: [!Ref ECSTaskSG]
+      LoadBalancers:
+        - ContainerName: orders-service
+          ContainerPort: 3000
+          TargetGroupArn: !Ref OrdersTG
+
+  # ── Auto Scaling for Users Service ───────────────────────────────────────
+  UsersScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: 10
+      MinCapacity: 2
+      ResourceId: !Sub 'service/${!ImportValue SAA-ECS-ClusterName}/saa-users-service'
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+
+  UsersCPUScaling:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: saa-users-cpu-scaling
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref UsersScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 70.0
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+
+Outputs:
+  ALBDNSName:
+    Value: !GetAtt ALB.DNSName
+    Description: Test with /users/health, /products/health, /orders/health
+
+  TestCommands:
+    Value: !Sub |
+      curl http://${ALB.DNSName}/users/health
+      curl http://${ALB.DNSName}/products/health
+      curl http://${ALB.DNSName}/orders/health
+    Description: Verify path-based routing to each microservice

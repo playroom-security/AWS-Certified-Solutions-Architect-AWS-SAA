@@ -1,0 +1,242 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  SAA Study Project 3.4 - Aurora MySQL cluster with 1 writer + 1 reader,
+  RDS Proxy for connection pooling, and Auto Scaling for read replicas.
+
+Parameters:
+  DBPassword:
+    Type: String
+    NoEcho: true
+    Default: SAAstudy123!
+
+Resources:
+
+  # ── VPC + Subnets ─────────────────────────────────────────────────────────
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.50.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags: [{Key: Name, Value: SAA-Aurora-VPC},{Key: Project, Value: SAA-Study}]
+
+  IGW:
+    Type: AWS::EC2::InternetGateway
+  IGWAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: {VpcId: !Ref VPC, InternetGatewayId: !Ref IGW}
+
+  PubSub:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.50.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+  PrivSub1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.50.2.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+  PrivSub2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.50.3.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+  PrivSub3:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.50.4.0/24
+      AvailabilityZone: !Select [2, !GetAZs '']
+
+  PubRT:
+    Type: AWS::EC2::RouteTable
+    Properties: {VpcId: !Ref VPC}
+  PubRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IGWAttach
+    Properties: {RouteTableId: !Ref PubRT, DestinationCidrBlock: 0.0.0.0/0, GatewayId: !Ref IGW}
+  PubSubAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PubSub, RouteTableId: !Ref PubRT}
+
+  # ── Security Groups ───────────────────────────────────────────────────────
+  AuroraSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Aurora MySQL - port 3306 within VPC
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 3306, ToPort: 3306, CidrIp: 10.50.0.0/16}
+
+  AppSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: App server outbound to Aurora
+      VpcId: !Ref VPC
+
+  # ── DB Subnet Group ───────────────────────────────────────────────────────
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Aurora subnets across 3 AZs
+      SubnetIds: [!Ref PrivSub1, !Ref PrivSub2, !Ref PrivSub3]
+
+  # ── Secrets Manager — Aurora credentials ─────────────────────────────────
+  AuroraSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: /prod/aurora/mysql-credentials
+      Description: Aurora MySQL admin credentials
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "admin"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludeCharacters: '"@/\'
+
+  # ── Aurora MySQL Cluster ──────────────────────────────────────────────────
+  AuroraCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Delete
+    Properties:
+      DBClusterIdentifier: saa-aurora-cluster
+      Engine: aurora-mysql
+      EngineVersion: '8.0.mysql_aurora.3.04.0'
+      MasterUsername: !Sub '{{resolve:secretsmanager:${AuroraSecret}:SecretString:username}}'
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${AuroraSecret}:SecretString:password}}'
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VpcSecurityGroupIds: [!Ref AuroraSG]
+      BackupRetentionPeriod: 1
+      DeletionProtection: false
+      StorageEncrypted: true
+      Tags: [{Key: Project, Value: SAA-Study}]
+
+  # Writer instance
+  AuroraWriter:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    Properties:
+      DBInstanceIdentifier: saa-aurora-writer
+      DBClusterIdentifier: !Ref AuroraCluster
+      DBInstanceClass: db.t3.medium
+      Engine: aurora-mysql
+      Tags: [{Key: Project, Value: SAA-Study}]
+
+  # Read replica instance
+  AuroraReader:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    Properties:
+      DBInstanceIdentifier: saa-aurora-reader-1
+      DBClusterIdentifier: !Ref AuroraCluster
+      DBInstanceClass: db.t3.medium
+      Engine: aurora-mysql
+      Tags: [{Key: Project, Value: SAA-Study}]
+
+  # Attach secret to Aurora cluster
+  AuroraSecretAttachment:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    DependsOn: AuroraWriter
+    Properties:
+      SecretId: !Ref AuroraSecret
+      TargetId: !Ref AuroraCluster
+      TargetType: AWS::RDS::DBCluster
+
+  # ── IAM Role for RDS Proxy ────────────────────────────────────────────────
+  RDSProxyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: rds.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ProxySecretsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource: !Ref AuroraSecret
+              - Effect: Allow
+                Action: kms:Decrypt
+                Resource: '*'
+
+  # ── RDS Proxy ─────────────────────────────────────────────────────────────
+  AuroraProxy:
+    Type: AWS::RDS::DBProxy
+    DependsOn: AuroraSecretAttachment
+    Properties:
+      DBProxyName: saa-aurora-proxy
+      EngineFamily: MYSQL
+      RoleArn: !GetAtt RDSProxyRole.Arn
+      Auth:
+        - AuthScheme: SECRETS
+          SecretArn: !Ref AuroraSecret
+          IAMAuth: DISABLED
+      VpcSubnetIds: [!Ref PrivSub1, !Ref PrivSub2]
+      VpcSecurityGroupIds: [!Ref AuroraSG]
+      RequireTLS: false
+      IdleClientTimeout: 1800
+      Tags:
+        - {Key: Project, Value: SAA-Study}
+
+  ProxyTargetGroup:
+    Type: AWS::RDS::DBProxyTargetGroup
+    Properties:
+      DBProxyName: !Ref AuroraProxy
+      TargetGroupName: default
+      DBClusterIdentifiers: [!Ref AuroraCluster]
+
+  # ── Aurora Auto Scaling for read replicas ────────────────────────────────
+  AuroraScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    DependsOn: AuroraReader
+    Properties:
+      MaxCapacity: 4
+      MinCapacity: 1
+      ResourceId: !Sub 'cluster:${AuroraCluster}'
+      ScalableDimension: rds:cluster:ReadReplicaCount
+      ServiceNamespace: rds
+
+  AuroraScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: saa-aurora-cpu-scaling
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref AuroraScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 70.0
+        PredefinedMetricSpecification:
+          PredefinedMetricType: RDSReaderAverageCPUUtilization
+        ScaleInCooldown: 300
+        ScaleOutCooldown: 300
+
+Outputs:
+  ClusterEndpoint:
+    Value: !GetAtt AuroraCluster.Endpoint.Address
+    Description: Writer endpoint - use for all INSERT/UPDATE/DELETE
+
+  ReaderEndpoint:
+    Value: !GetAtt AuroraCluster.ReadEndpoint.Address
+    Description: Reader endpoint - load-balanced across all replicas
+
+  ProxyEndpoint:
+    Value: !GetAtt AuroraProxy.Endpoint
+    Description: RDS Proxy endpoint - use this instead of direct cluster endpoints
+
+  SecretArn:
+    Value: !Ref AuroraSecret
+    Description: Retrieve credentials with get-secret.py
+
+  RetrieveCredsCommand:
+    Value: !Sub 'aws secretsmanager get-secret-value --secret-id ${AuroraSecret} --query SecretString --output text'
+    Description: Retrieve the auto-generated Aurora password

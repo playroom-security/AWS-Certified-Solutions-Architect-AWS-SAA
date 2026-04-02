@@ -1,0 +1,186 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  SAA Study Project 3.2 - ElastiCache Redis cluster + RDS MySQL +
+  EC2 application server for caching pattern demonstration.
+
+Parameters:
+  DBPassword:
+    Type: String
+    NoEcho: true
+    Default: SAAstudy123!
+
+Resources:
+
+  # ── VPC ───────────────────────────────────────────────────────────────────
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.40.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags: [{Key: Name, Value: SAA-Cache-VPC},{Key: Project, Value: SAA-Study}]
+
+  IGW:
+    Type: AWS::EC2::InternetGateway
+  IGWAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: {VpcId: !Ref VPC, InternetGatewayId: !Ref IGW}
+
+  PubSub:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.40.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+  PrivSub1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.40.2.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+  PrivSub2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.40.3.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+
+  PubRT:
+    Type: AWS::EC2::RouteTable
+    Properties: {VpcId: !Ref VPC}
+  PubRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IGWAttach
+    Properties: {RouteTableId: !Ref PubRT, DestinationCidrBlock: 0.0.0.0/0, GatewayId: !Ref IGW}
+  PubSubAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PubSub, RouteTableId: !Ref PubRT}
+
+  # ── Security Groups ───────────────────────────────────────────────────────
+  AppSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: App server - SSH and outbound
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 22, ToPort: 22, CidrIp: 0.0.0.0/0}
+  RedisSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Redis - port 6379 from app server
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 6379, ToPort: 6379, SourceSecurityGroupId: !Ref AppSG}
+  DBSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: MySQL - port 3306 from app server
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 3306, ToPort: 3306, SourceSecurityGroupId: !Ref AppSG}
+
+  # ── EC2 App Server ────────────────────────────────────────────────────────
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - {Effect: Allow, Principal: {Service: ec2.amazonaws.com}, Action: sts:AssumeRole}
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+  EC2Profile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: {Roles: [!Ref EC2Role]}
+
+  AppServer:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64}}'
+      InstanceType: t3.micro
+      SubnetId: !Ref PubSub
+      SecurityGroupIds: [!Ref AppSG]
+      IamInstanceProfile: !Ref EC2Profile
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          yum update -y
+          yum install -y python3 python3-pip redis
+          pip3 install redis pymysql boto3
+          echo "App server ready. Connect via Session Manager." > /tmp/setup.log
+      Tags:
+        - {Key: Name, Value: SAA-CacheApp}
+        - {Key: Project, Value: SAA-Study}
+
+  # ── ElastiCache Redis Subnet Group ────────────────────────────────────────
+  RedisSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: Redis subnet group across 2 AZs
+      SubnetIds: [!Ref PrivSub1, !Ref PrivSub2]
+
+  # ── ElastiCache Redis Replication Group (primary + 1 replica) ────────────
+  RedisCluster:
+    Type: AWS::ElastiCache::ReplicationGroup
+    Properties:
+      ReplicationGroupDescription: SAA Study - Redis caching cluster
+      ReplicationGroupId: saa-redis-cluster
+      CacheNodeType: cache.t3.micro
+      Engine: redis
+      EngineVersion: '7.0'
+      NumCacheClusters: 2             # 1 primary + 1 replica
+      CacheSubnetGroupName: !Ref RedisSubnetGroup
+      SecurityGroupIds: [!Ref RedisSG]
+      AutomaticFailoverEnabled: true  # Promotes replica on primary failure
+      AtRestEncryptionEnabled: true
+      TransitEncryptionEnabled: false # Disable for lab simplicity
+      Tags:
+        - {Key: Project, Value: SAA-Study}
+
+  # ── RDS MySQL ─────────────────────────────────────────────────────────────
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: RDS subnets for caching demo
+      SubnetIds: [!Ref PrivSub1, !Ref PrivSub2]
+
+  RDS:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    Properties:
+      DBInstanceIdentifier: saa-cache-mysql
+      DBInstanceClass: db.t3.micro
+      Engine: mysql
+      EngineVersion: '8.0'
+      MasterUsername: admin
+      MasterUserPassword: !Ref DBPassword
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups: [!Ref DBSG]
+      AllocatedStorage: '20'
+      StorageType: gp3
+      MultiAZ: false
+      PubliclyAccessible: false
+      DeletionProtection: false
+      Tags: [{Key: Project, Value: SAA-Study}]
+
+Outputs:
+  RedisEndpoint:
+    Value: !GetAtt RedisCluster.PrimaryEndPoint.Address
+    Description: Redis primary endpoint - use in cache-demo.py REDIS_HOST
+
+  RedisReaderEndpoint:
+    Value: !GetAtt RedisCluster.ReaderEndPoint.Address
+    Description: Redis replica endpoint for read-only connections
+
+  RDSEndpoint:
+    Value: !GetAtt RDS.Endpoint.Address
+    Description: MySQL RDS endpoint - use in cache-demo.py DB_HOST
+
+  AppServerInstanceId:
+    Value: !Ref AppServer
+    Description: Connect via Session Manager to run cache-demo.py
+
+  ConnectCommand:
+    Value: !Sub 'aws ssm start-session --target ${AppServer}'
+    Description: Connect to app server (no SSH key needed)

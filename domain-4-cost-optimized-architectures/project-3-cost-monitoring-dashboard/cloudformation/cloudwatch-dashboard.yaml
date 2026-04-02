@@ -1,0 +1,279 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  SAA Study Project 4.3 - CloudWatch Dashboard combining billing metrics
+  with operational metrics (EC2, RDS, Lambda) for a unified cost + ops view.
+  NOTE: Billing metrics are only available in us-east-1.
+  Deploy this stack in us-east-1.
+
+Parameters:
+  DashboardName:
+    Type: String
+    Default: SAA-Study-Cost-and-Ops
+
+Resources:
+
+  CostAndOpsDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Ref DashboardName
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+
+            {
+              "type": "text",
+              "x": 0, "y": 0, "width": 24, "height": 2,
+              "properties": {
+                "markdown": "# SAA Study - Cost & Operations Dashboard\nCombines **billing metrics** with **operational metrics** for a unified view.\n> Billing metrics update once per day. Operational metrics update every 1-5 minutes."
+              }
+            },
+
+            {
+              "type": "metric",
+              "x": 0, "y": 2, "width": 8, "height": 6,
+              "properties": {
+                "title": "💰 Estimated Total Charges (USD)",
+                "view": "timeSeries",
+                "stacked": false,
+                "metrics": [
+                  ["AWS/Billing", "EstimatedCharges", "Currency", "USD",
+                    {"stat": "Maximum", "period": 86400, "color": "#d62728", "label": "Total Estimated Charges"}]
+                ],
+                "period": 86400,
+                "region": "us-east-1",
+                "yAxis": {"left": {"min": 0}},
+                "annotations": {
+                  "horizontal": [
+                    {"value": 50, "color": "#ff7f0e", "label": "Budget ($50)", "fill": "above"}
+                  ]
+                }
+              }
+            },
+
+            {
+              "type": "metric",
+              "x": 8, "y": 2, "width": 8, "height": 6,
+              "properties": {
+                "title": "💰 Charges by Top Services (USD)",
+                "view": "timeSeries",
+                "stacked": true,
+                "metrics": [
+                  ["AWS/Billing", "EstimatedCharges", "ServiceName", "Amazon Elastic Compute Cloud - Compute",
+                    "Currency", "USD", {"stat": "Maximum", "period": 86400, "label": "EC2"}],
+                  ["AWS/Billing", "EstimatedCharges", "ServiceName", "Amazon Relational Database Service",
+                    "Currency", "USD", {"stat": "Maximum", "period": 86400, "label": "RDS"}],
+                  ["AWS/Billing", "EstimatedCharges", "ServiceName", "Amazon Simple Storage Service",
+                    "Currency", "USD", {"stat": "Maximum", "period": 86400, "label": "S3"}],
+                  ["AWS/Billing", "EstimatedCharges", "ServiceName", "AWS Lambda",
+                    "Currency", "USD", {"stat": "Maximum", "period": 86400, "label": "Lambda"}],
+                  ["AWS/Billing", "EstimatedCharges", "ServiceName", "Amazon ElastiCache",
+                    "Currency", "USD", {"stat": "Maximum", "period": 86400, "label": "ElastiCache"}]
+                ],
+                "period": 86400,
+                "region": "us-east-1"
+              }
+            },
+
+            {
+              "type": "metric",
+              "x": 16, "y": 2, "width": 8, "height": 6,
+              "properties": {
+                "title": "💰 Data Transfer Charges (USD)",
+                "view": "timeSeries",
+                "metrics": [
+                  ["AWS/Billing", "EstimatedCharges", "ServiceName", "AWSDataTransfer",
+                    "Currency", "USD", {"stat": "Maximum", "period": 86400, "label": "Data Transfer Out"}]
+                ],
+                "period": 86400,
+                "region": "us-east-1",
+                "annotations": {
+                  "horizontal": [
+                    {"value": 0, "color": "#2ca02c", "label": "First 100 GB free/month"}
+                  ]
+                }
+              }
+            },
+
+            {
+              "type": "text",
+              "x": 0, "y": 8, "width": 24, "height": 1,
+              "properties": {
+                "markdown": "## EC2 Metrics"
+              }
+            },
+
+            {
+              "type": "metric",
+              "x": 0, "y": 9, "width": 8, "height": 6,
+              "properties": {
+                "title": "EC2 CPU Utilization (all instances)",
+                "view": "timeSeries",
+                "metrics": [
+                  ["AWS/EC2", "CPUUtilization", {"stat": "Average", "period": 300, "label": "Avg CPU %"}],
+                  ["AWS/EC2", "CPUUtilization", {"stat": "Maximum", "period": 300, "label": "Max CPU %"}]
+                ],
+                "period": 300,
+                "region": "${AWS::Region}",
+                "yAxis": {"left": {"min": 0, "max": 100}},
+                "annotations": {
+                  "horizontal": [
+                    {"value": 70, "color": "#ff7f0e", "label": "Scale-out threshold"}
+                  ]
+                }
+              }
+            },
+
+            {
+              "type": "metric",
+              "x": 8, "y": 9, "width": 8, "height": 6,
+              "properties": {
+                "title": "EC2 Network In/Out (bytes)",
+                "view": "timeSeries",
+                "stacked": false,
+                "metrics": [
+                  ["AWS/EC2", "NetworkIn",  {"stat": "Sum", "period": 300, "label": "Network In"}],
+                  ["AWS/EC2", "NetworkOut", {"stat": "Sum", "period": 300, "label": "Network Out"}]
+                ],
+                "period": 300,
+                "region": "${AWS::Region}"
+              }
+            },
+
+            {
+              "type": "metric",
+              "x": 16, "y": 9, "width": 8, "height": 6,
+              "properties": {
+                "title": "EBS Read/Write Operations",
+                "view": "timeSeries",
+                "metrics": [
+                  ["AWS/EC2", "EBSReadOps",  {"stat": "Sum", "period": 300, "label": "Read IOPS"}],
+                  ["AWS/EC2", "EBSWriteOps", {"stat": "Sum", "period": 300, "label": "Write IOPS"}]
+                ],
+                "period": 300,
+                "region": "${AWS::Region}"
+              }
+            },
+
+            {
+              "type": "text",
+              "x": 0, "y": 15, "width": 24, "height": 1,
+              "properties": {
+                "markdown": "## Lambda & Serverless Metrics"
+              }
+            },
+
+            {
+              "type": "metric",
+              "x": 0, "y": 16, "width": 8, "height": 6,
+              "properties": {
+                "title": "Lambda Invocations (all functions)",
+                "view": "timeSeries",
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", {"stat": "Sum", "period": 300, "label": "Total Invocations"}],
+                  ["AWS/Lambda", "Errors",      {"stat": "Sum", "period": 300, "label": "Errors", "color": "#d62728"}]
+                ],
+                "period": 300,
+                "region": "${AWS::Region}"
+              }
+            },
+
+            {
+              "type": "metric",
+              "x": 8, "y": 16, "width": 8, "height": 6,
+              "properties": {
+                "title": "Lambda Duration (ms) - Cost Driver",
+                "view": "timeSeries",
+                "metrics": [
+                  ["AWS/Lambda", "Duration", {"stat": "Average", "period": 300, "label": "Avg Duration"}],
+                  ["AWS/Lambda", "Duration", {"stat": "p99",     "period": 300, "label": "p99 Duration"}]
+                ],
+                "period": 300,
+                "region": "${AWS::Region}",
+                "annotations": {
+                  "horizontal": [
+                    {"value": 3000, "color": "#ff7f0e", "label": "3s - consider optimising memory"}
+                  ]
+                }
+              }
+            },
+
+            {
+              "type": "metric",
+              "x": 16, "y": 16, "width": 8, "height": 6,
+              "properties": {
+                "title": "Lambda Concurrent Executions",
+                "view": "timeSeries",
+                "metrics": [
+                  ["AWS/Lambda", "ConcurrentExecutions",         {"stat": "Maximum", "period": 300, "label": "Concurrent"}],
+                  ["AWS/Lambda", "UnreservedConcurrentExecutions",{"stat": "Maximum", "period": 300, "label": "Unreserved"}]
+                ],
+                "period": 300,
+                "region": "${AWS::Region}",
+                "annotations": {
+                  "horizontal": [
+                    {"value": 1000, "color": "#d62728", "label": "Default account limit"}
+                  ]
+                }
+              }
+            },
+
+            {
+              "type": "text",
+              "x": 0, "y": 22, "width": 24, "height": 1,
+              "properties": {
+                "markdown": "## S3 Storage Metrics"
+              }
+            },
+
+            {
+              "type": "metric",
+              "x": 0, "y": 23, "width": 12, "height": 6,
+              "properties": {
+                "title": "S3 Bucket Size (bytes) by Storage Class",
+                "view": "timeSeries",
+                "stacked": true,
+                "metrics": [
+                  ["AWS/S3", "BucketSizeBytes", "StorageType", "StandardStorage",
+                    "BucketName", "ALL", {"stat": "Average", "period": 86400, "label": "Standard"}],
+                  ["AWS/S3", "BucketSizeBytes", "StorageType", "StandardIAStorage",
+                    "BucketName", "ALL", {"stat": "Average", "period": 86400, "label": "Standard-IA"}],
+                  ["AWS/S3", "BucketSizeBytes", "StorageType", "GlacierStorage",
+                    "BucketName", "ALL", {"stat": "Average", "period": 86400, "label": "Glacier"}]
+                ],
+                "period": 86400,
+                "region": "${AWS::Region}"
+              }
+            },
+
+            {
+              "type": "metric",
+              "x": 12, "y": 23, "width": 12, "height": 6,
+              "properties": {
+                "title": "S3 Number of Objects",
+                "view": "timeSeries",
+                "metrics": [
+                  ["AWS/S3", "NumberOfObjects", "StorageType", "AllStorageTypes",
+                    "BucketName", "ALL", {"stat": "Average", "period": 86400}]
+                ],
+                "period": 86400,
+                "region": "${AWS::Region}"
+              }
+            }
+
+          ]
+        }
+
+Outputs:
+  DashboardName:
+    Value: !Ref DashboardName
+    Description: CloudWatch Dashboard name
+
+  DashboardURL:
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${DashboardName}'
+    Description: Direct link to the CloudWatch dashboard
+
+  Note:
+    Value: >
+      Billing metrics (top row) only appear if this stack is deployed in us-east-1.
+      Billing data updates once every 24 hours so the billing widgets will
+      show "No data" for up to 24 hours after first deployment.

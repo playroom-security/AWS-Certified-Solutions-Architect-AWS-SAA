@@ -1,0 +1,234 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  SAA Study Project 4.3 - AWS Budgets with email and SNS alerts.
+  Creates three budgets: total account cost, EC2-specific cost,
+  and a forecasted spend alert so you are warned before overspending.
+  Also creates a CloudWatch billing alarm as a second safety net.
+
+Parameters:
+  AlertEmail:
+    Type: String
+    Description: Email address to receive budget and billing alerts
+    Default: your@email.com
+  MonthlyBudgetLimit:
+    Type: Number
+    Default: 50
+    Description: Monthly total account budget in USD
+  EC2BudgetLimit:
+    Type: Number
+    Default: 20
+    Description: Monthly EC2-specific budget in USD
+
+Resources:
+
+  # ── SNS Topic for budget alerts ───────────────────────────────────────────
+  BudgetAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: saa-budget-alerts
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+      Tags:
+        - {Key: Project, Value: SAA-Study}
+
+  # SNS policy allowing AWS Budgets service to publish
+  BudgetAlertTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref BudgetAlertTopic]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowBudgetsPublish
+            Effect: Allow
+            Principal:
+              Service: budgets.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref BudgetAlertTopic
+
+  # ── Budget 1: Total Account Monthly Cost ─────────────────────────────────
+  TotalAccountBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: SAA-Study-Total-Monthly
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit:
+          Amount: !Ref MonthlyBudgetLimit
+          Unit: USD
+        CostTypes:
+          IncludeTax: true
+          IncludeSubscription: true
+          UseBlended: false
+          IncludeRefund: false
+          IncludeCredit: false
+          IncludeUpfront: true
+          IncludeRecurring: true
+          IncludeOtherSubscription: true
+          IncludeSupport: true
+          IncludeDiscount: true
+          UseAmortized: false
+      NotificationsWithSubscribers:
+
+        # Alert 1: 70% of actual spend
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 70
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref AlertEmail
+            - SubscriptionType: SNS
+              Address: !Ref BudgetAlertTopic
+
+        # Alert 2: 100% of actual spend (you've hit the budget!)
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref AlertEmail
+            - SubscriptionType: SNS
+              Address: !Ref BudgetAlertTopic
+
+        # Alert 3: 90% of FORECASTED spend (predictive — fires before you hit budget)
+        - Notification:
+            NotificationType: FORECASTED
+            ComparisonOperator: GREATER_THAN
+            Threshold: 90
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref AlertEmail
+
+  # ── Budget 2: EC2-Specific Cost ───────────────────────────────────────────
+  EC2Budget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: SAA-Study-EC2-Monthly
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit:
+          Amount: !Ref EC2BudgetLimit
+          Unit: USD
+        CostFilters:
+          Service:
+            - Amazon Elastic Compute Cloud - Compute  # Filters to EC2 only
+        CostTypes:
+          IncludeTax: true
+          IncludeSubscription: true
+          UseBlended: false
+          IncludeRefund: false
+          IncludeCredit: false
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref AlertEmail
+        - Notification:
+            NotificationType: FORECASTED
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref AlertEmail
+
+  # ── Budget 3: SAA-Study Tagged Resources ─────────────────────────────────
+  StudyTagBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: SAA-Study-Tagged-Resources
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit:
+          Amount: !Ref MonthlyBudgetLimit
+          Unit: USD
+        CostFilters:
+          TagKeyValue:
+            - user:Project$SAA-Study    # Only resources tagged Project=SAA-Study
+        CostTypes:
+          IncludeTax: true
+          IncludeSubscription: true
+          UseBlended: false
+          IncludeRefund: false
+          IncludeCredit: false
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref AlertEmail
+
+  # ── CloudWatch Billing Alarm (backup safety net) ──────────────────────────
+  # NOTE: Billing metrics only exist in us-east-1.
+  # This alarm must be created in us-east-1 regardless of your main region.
+  BillingAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: SAA-Study-EstimatedCharges
+      AlarmDescription: !Sub 'Alert when estimated AWS charges exceed $${MonthlyBudgetLimit}'
+      Namespace: AWS/Billing
+      MetricName: EstimatedCharges
+      Dimensions:
+        - Name: Currency
+          Value: USD
+      Statistic: Maximum
+      Period: 86400               # Check once per day (billing metrics update daily)
+      EvaluationPeriods: 1
+      Threshold: !Ref MonthlyBudgetLimit
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref BudgetAlertTopic
+      OKActions:
+        - !Ref BudgetAlertTopic
+      Tags:
+        - {Key: Project, Value: SAA-Study}
+
+Outputs:
+  BudgetAlertTopicArn:
+    Value: !Ref BudgetAlertTopic
+    Description: SNS topic ARN - subscribe additional endpoints here
+
+  TotalBudgetName:
+    Value: !Sub '${TotalAccountBudget}'
+    Description: Total account budget name
+
+  EC2BudgetName:
+    Value: !Sub '${EC2Budget}'
+    Description: EC2-specific budget name
+
+  ImportantNote:
+    Value: >
+      IMPORTANT: Check your email inbox and confirm the SNS subscription
+      to start receiving budget alerts. Without confirmation, emails will
+      not be delivered even when thresholds are breached.
+
+  SubscribeAdditionalEmail:
+    Value: !Sub |
+      aws sns subscribe \
+        --topic-arn ${BudgetAlertTopic} \
+        --protocol email \
+        --notification-endpoint another@email.com
+    Description: Add more email recipients to the budget alert topic
+
+  ActivateTagsNote:
+    Value: >
+      Go to Billing > Cost Allocation Tags and activate the 'Project' tag
+      to enable the SAA-Study tagged resource budget to work correctly.
+      Tags must be activated before they appear in Cost Explorer reports.

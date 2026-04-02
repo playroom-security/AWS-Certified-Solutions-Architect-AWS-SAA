@@ -1,0 +1,149 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  SAA Study Project 2.1 - Optional standalone VPC prerequisite stack.
+  Use this if you want a shared VPC that multiple stacks can import via
+  cross-stack references. If you deploy multi-az-webapp.yaml on its own,
+  you do NOT need this — that template is fully self-contained.
+
+  Deploy order when using this approach:
+    1. vpc-prereq.yaml       (creates VPC, exports IDs)
+    2. multi-az-webapp.yaml  (imports VPC IDs, add parameter UseExistingVPC=true)
+
+Resources:
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.1.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - {Key: Name,    Value: SAA-MultiAZ-VPC}
+        - {Key: Project, Value: SAA-Study}
+
+  IGW:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{Key: Project, Value: SAA-Study}]
+
+  IGWAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: {VpcId: !Ref VPC, InternetGatewayId: !Ref IGW}
+
+  # ── Public Subnets ────────────────────────────────────────────────────────
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.1.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags: [{Key: Name, Value: SAA-Public-1a}]
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.1.3.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags: [{Key: Name, Value: SAA-Public-1b}]
+
+  # ── Private Subnets ───────────────────────────────────────────────────────
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.1.2.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags: [{Key: Name, Value: SAA-Private-1a}]
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.1.4.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags: [{Key: Name, Value: SAA-Private-1b}]
+
+  # ── NAT Gateway ───────────────────────────────────────────────────────────
+  NatEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: IGWAttach
+    Properties: {Domain: vpc}
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags: [{Key: Name, Value: SAA-NatGW}]
+
+  # ── Route Tables ──────────────────────────────────────────────────────────
+  PublicRT:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags: [{Key: Name, Value: SAA-Public-RT}]
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IGWAttach
+    Properties:
+      RouteTableId: !Ref PublicRT
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref IGW
+
+  PubSub1RTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PublicSubnet1, RouteTableId: !Ref PublicRT}
+  PubSub2RTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PublicSubnet2, RouteTableId: !Ref PublicRT}
+
+  PrivateRT:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags: [{Key: Name, Value: SAA-Private-RT}]
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRT
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivSub1RTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PrivateSubnet1, RouteTableId: !Ref PrivateRT}
+  PrivSub2RTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PrivateSubnet2, RouteTableId: !Ref PrivateRT}
+
+# ── Exports (importable by other stacks) ─────────────────────────────────────
+Outputs:
+  VPCId:
+    Value: !Ref VPC
+    Export: {Name: SAA-P21-VPCId}
+    Description: VPC ID
+
+  PublicSubnet1Id:
+    Value: !Ref PublicSubnet1
+    Export: {Name: SAA-P21-PubSub1}
+
+  PublicSubnet2Id:
+    Value: !Ref PublicSubnet2
+    Export: {Name: SAA-P21-PubSub2}
+
+  PrivateSubnet1Id:
+    Value: !Ref PrivateSubnet1
+    Export: {Name: SAA-P21-PrivSub1}
+
+  PrivateSubnet2Id:
+    Value: !Ref PrivateSubnet2
+    Export: {Name: SAA-P21-PrivSub2}
+
+  NatGatewayId:
+    Value: !Ref NatGateway
+    Description: NAT Gateway ID — delete this first when cleaning up to stop charges

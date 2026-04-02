@@ -1,0 +1,153 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  SAA Study Project 2.2 - SQS Queues: OrderQueue, EmailQueue,
+  InventoryQueue, and a Dead Letter Queue (DLQ) for failed messages.
+
+Resources:
+
+  # ── Dead Letter Queue (receives messages after maxReceiveCount failures) ──
+  OrderDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: saa-order-dlq
+      MessageRetentionPeriod: 1209600   # 14 days (max)
+      Tags:
+        - {Key: Project, Value: SAA-Study}
+
+  # ── Main Order Queue ──────────────────────────────────────────────────────
+  OrderQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: saa-order-queue
+      VisibilityTimeout: 30             # Seconds message is invisible while processing
+      MessageRetentionPeriod: 345600    # 4 days
+      ReceiveMessageWaitTimeSeconds: 20 # Long polling (reduces empty receives + cost)
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt OrderDLQ.Arn
+        maxReceiveCount: 3              # Move to DLQ after 3 failed attempts
+      Tags:
+        - {Key: Project, Value: SAA-Study}
+
+  # ── Email Notification Queue ──────────────────────────────────────────────
+  EmailQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: saa-email-queue
+      VisibilityTimeout: 60
+      MessageRetentionPeriod: 86400     # 1 day (emails expire quickly)
+      ReceiveMessageWaitTimeSeconds: 20
+      Tags:
+        - {Key: Project, Value: SAA-Study}
+
+  # ── Inventory Update Queue ────────────────────────────────────────────────
+  InventoryQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: saa-inventory-queue
+      VisibilityTimeout: 60
+      MessageRetentionPeriod: 345600
+      ReceiveMessageWaitTimeSeconds: 20
+      Tags:
+        - {Key: Project, Value: SAA-Study}
+
+  # ── SNS Topic for fan-out ─────────────────────────────────────────────────
+  OrderEventsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: saa-order-events
+      Tags:
+        - {Key: Project, Value: SAA-Study}
+
+  # Allow SNS to publish to SQS queues
+  EmailQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref EmailQueue]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt EmailQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref OrderEventsTopic
+
+  InventoryQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref InventoryQueue]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt InventoryQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref OrderEventsTopic
+
+  # SNS → SQS subscriptions (fan-out)
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref OrderEventsTopic
+      Protocol: sqs
+      Endpoint: !GetAtt EmailQueue.Arn
+      RawMessageDelivery: false
+
+  InventorySubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref OrderEventsTopic
+      Protocol: sqs
+      Endpoint: !GetAtt InventoryQueue.Arn
+      RawMessageDelivery: false
+
+  # ── DynamoDB table for processed orders ───────────────────────────────────
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: Orders
+      BillingMode: PAY_PER_REQUEST     # Serverless billing - no capacity planning
+      AttributeDefinitions:
+        - AttributeName: orderId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: orderId
+          KeyType: HASH
+      Tags:
+        - {Key: Project, Value: SAA-Study}
+
+Outputs:
+  OrderQueueUrl:
+    Value: !Ref OrderQueue
+    Export: {Name: SAA-OrderQueue-Url}
+
+  OrderQueueArn:
+    Value: !GetAtt OrderQueue.Arn
+    Export: {Name: SAA-OrderQueue-Arn}
+
+  EmailQueueUrl:
+    Value: !Ref EmailQueue
+    Export: {Name: SAA-EmailQueue-Url}
+
+  InventoryQueueUrl:
+    Value: !Ref InventoryQueue
+    Export: {Name: SAA-InventoryQueue-Url}
+
+  DLQUrl:
+    Value: !Ref OrderDLQ
+    Description: Monitor this queue for failed messages
+
+  SNSTopicArn:
+    Value: !Ref OrderEventsTopic
+    Export: {Name: SAA-OrderEvents-TopicArn}
+
+  OrdersTableName:
+    Value: !Ref OrdersTable
+    Export: {Name: SAA-Orders-TableName}

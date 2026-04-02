@@ -1,0 +1,213 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  SAA Study Project 2.4 - ECS Fargate Task Definitions for
+  Users, Products, and Orders microservices.
+  Update the ECR image URIs after running scripts/build-push-all.sh.
+
+Parameters:
+  AccountId:
+    Type: String
+    Default: !Sub '${AWS::AccountId}'
+  EcrRegion:
+    Type: String
+    Default: us-east-1
+
+Resources:
+
+  # ── ECS Cluster ───────────────────────────────────────────────────────────
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: saa-microservices
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled    # CloudWatch Container Insights monitoring
+      Tags:
+        - {Key: Project, Value: SAA-Study}
+
+  # ── CloudWatch Log Groups ─────────────────────────────────────────────────
+  UsersLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/saa-users-service
+      RetentionInDays: 7
+
+  ProductsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/saa-products-service
+      RetentionInDays: 7
+
+  OrdersLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/saa-orders-service
+      RetentionInDays: 7
+
+  # ── ECS Task Execution Role ───────────────────────────────────────────────
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: saa-ecs-task-execution-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # Allows ECS to: pull images from ECR, write logs to CloudWatch
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Tags:
+        - {Key: Project, Value: SAA-Study}
+
+  # ── ECS Task Role (what the container code can do) ────────────────────────
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: saa-ecs-task-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AppPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource: !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/saa-*'
+      Tags:
+        - {Key: Project, Value: SAA-Study}
+
+  # ── Task Definition: Users Service ───────────────────────────────────────
+  UsersTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: saa-users-service
+      NetworkMode: awsvpc           # Required for Fargate
+      RequiresCompatibilities: [FARGATE]
+      Cpu: '256'                    # 0.25 vCPU
+      Memory: '512'                 # 512 MB
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: users-service
+          # Replace with your ECR image URI after pushing:
+          # ACCOUNT.dkr.ecr.us-east-1.amazonaws.com/saa-users-service:latest
+          Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/saa-users-service:latest'
+          PortMappings:
+            - ContainerPort: 3000
+              Protocol: tcp
+          Environment:
+            - Name: PORT
+              Value: '3000'
+            - Name: SERVICE_NAME
+              Value: users
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: /ecs/saa-users-service
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          Essential: true
+      Tags:
+        - {Key: Project, Value: SAA-Study}
+
+  # ── Task Definition: Products Service ────────────────────────────────────
+  ProductsTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: saa-products-service
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      Cpu: '256'
+      Memory: '512'
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: products-service
+          Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/saa-products-service:latest'
+          PortMappings:
+            - ContainerPort: 3000
+              Protocol: tcp
+          Environment:
+            - Name: PORT
+              Value: '3000'
+            - Name: SERVICE_NAME
+              Value: products
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: /ecs/saa-products-service
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          Essential: true
+      Tags:
+        - {Key: Project, Value: SAA-Study}
+
+  # ── Task Definition: Orders Service ──────────────────────────────────────
+  OrdersTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: saa-orders-service
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      Cpu: '256'
+      Memory: '512'
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: orders-service
+          Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/saa-orders-service:latest'
+          PortMappings:
+            - ContainerPort: 3000
+              Protocol: tcp
+          Environment:
+            - Name: PORT
+              Value: '3000'
+            - Name: SERVICE_NAME
+              Value: orders
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: /ecs/saa-orders-service
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          Essential: true
+      Tags:
+        - {Key: Project, Value: SAA-Study}
+
+Outputs:
+  ClusterName:
+    Value: !Ref ECSCluster
+    Export: {Name: SAA-ECS-ClusterName}
+
+  ClusterArn:
+    Value: !GetAtt ECSCluster.Arn
+    Export: {Name: SAA-ECS-ClusterArn}
+
+  TaskExecutionRoleArn:
+    Value: !GetAtt TaskExecutionRole.Arn
+    Export: {Name: SAA-ECS-ExecutionRoleArn}
+
+  UsersTaskDefArn:
+    Value: !Ref UsersTaskDefinition
+    Export: {Name: SAA-ECS-UsersTaskDef}
+
+  ProductsTaskDefArn:
+    Value: !Ref ProductsTaskDefinition
+    Export: {Name: SAA-ECS-ProductsTaskDef}
+
+  OrdersTaskDefArn:
+    Value: !Ref OrdersTaskDefinition
+    Export: {Name: SAA-ECS-OrdersTaskDef}

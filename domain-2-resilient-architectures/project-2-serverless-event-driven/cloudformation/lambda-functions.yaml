@@ -1,0 +1,217 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  SAA Study Project 2.2 - Lambda functions with SQS event source mappings
+  and EventBridge scheduled rule. Requires sqs-queues.yaml deployed first.
+
+Resources:
+
+  # ── Lambda Execution Role ─────────────────────────────────────────────────
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: saa-event-driven-lambda-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SQSDynamoSNSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:ChangeMessageVisibility
+                Resource:
+                  - !ImportValue SAA-OrderQueue-Arn
+                  - !Sub 'arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:saa-email-queue'
+                  - !Sub 'arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:saa-inventory-queue'
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:GetItem
+                Resource: !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/Orders'
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !ImportValue SAA-OrderEvents-TopicArn
+
+  # ── Process Order Lambda ──────────────────────────────────────────────────
+  ProcessOrderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: saa-process-order
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          ORDERS_TABLE: !ImportValue SAA-Orders-TableName
+          SNS_TOPIC_ARN: !ImportValue SAA-OrderEvents-TopicArn
+      Code:
+        ZipFile: |
+          import json, os, uuid, boto3
+          from datetime import datetime
+          dynamodb = boto3.resource('dynamodb')
+          sns = boto3.client('sns')
+          def lambda_handler(event, context):
+              table = dynamodb.Table(os.environ['ORDERS_TABLE'])
+              failures = []
+              for record in event['Records']:
+                  try:
+                      body = json.loads(record['body'])
+                      order_id = body.get('orderId', str(uuid.uuid4()))
+                      table.put_item(Item={
+                          'orderId': order_id,
+                          'item': body.get('item', 'unknown'),
+                          'status': 'PROCESSED',
+                          'processedAt': datetime.utcnow().isoformat()
+                      })
+                      sns.publish(
+                          TopicArn=os.environ['SNS_TOPIC_ARN'],
+                          Message=json.dumps({'orderId': order_id, 'status': 'PROCESSED'}),
+                          Subject='Order Processed'
+                      )
+                      print(f'Processed order: {order_id}')
+                  except Exception as e:
+                      print(f'Error: {e}')
+                      failures.append({'itemIdentifier': record['messageId']})
+              return {'batchItemFailures': failures}
+      Tags:
+        - {Key: Project, Value: SAA-Study}
+
+  # SQS → ProcessOrder event source mapping
+  ProcessOrderTrigger:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !ImportValue SAA-OrderQueue-Arn
+      FunctionName: !GetAtt ProcessOrderFunction.Arn
+      BatchSize: 10
+      FunctionResponseTypes:
+        - ReportBatchItemFailures   # Partial batch failure support
+      BisectBatchOnFunctionError: true
+
+  # ── Send Email Lambda ─────────────────────────────────────────────────────
+  SendEmailFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: saa-send-email
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 15
+      Code:
+        ZipFile: |
+          import json
+          def lambda_handler(event, context):
+              for record in event['Records']:
+                  body = json.loads(record['body'])
+                  # Unwrap SNS envelope if message came via SNS→SQS
+                  if 'Message' in body:
+                      body = json.loads(body['Message'])
+                  print(f"[EMAIL] Sending confirmation for order: {body.get('orderId', 'N/A')}")
+              return {'statusCode': 200}
+      Tags:
+        - {Key: Project, Value: SAA-Study}
+
+  EmailTrigger:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !Sub 'arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:saa-email-queue'
+      FunctionName: !GetAtt SendEmailFunction.Arn
+      BatchSize: 5
+
+  # ── Update Inventory Lambda ───────────────────────────────────────────────
+  UpdateInventoryFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: saa-update-inventory
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 15
+      Code:
+        ZipFile: |
+          import json
+          def lambda_handler(event, context):
+              for record in event['Records']:
+                  body = json.loads(record['body'])
+                  if 'Message' in body:
+                      body = json.loads(body['Message'])
+                  print(f"[INVENTORY] Updating stock for order: {body.get('orderId', 'N/A')}")
+              return {'statusCode': 200}
+      Tags:
+        - {Key: Project, Value: SAA-Study}
+
+  InventoryTrigger:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !Sub 'arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:saa-inventory-queue'
+      FunctionName: !GetAtt UpdateInventoryFunction.Arn
+      BatchSize: 5
+
+  # ── Daily Report Lambda (EventBridge Scheduler) ───────────────────────────
+  DailyReportFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: saa-daily-report
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import json
+          from datetime import datetime
+          def lambda_handler(event, context):
+              print(f"[REPORT] Generating daily report at {datetime.utcnow().isoformat()}")
+              print("[REPORT] Querying DynamoDB for today's orders...")
+              print("[REPORT] Report complete - would publish to S3/email in production")
+              return {'statusCode': 200, 'report_date': datetime.utcnow().date().isoformat()}
+      Tags:
+        - {Key: Project, Value: SAA-Study}
+
+  # EventBridge rule: run daily at 6 AM UTC
+  DailyReportRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: saa-daily-report-trigger
+      Description: Triggers the daily report Lambda at 6 AM UTC every day
+      ScheduleExpression: cron(0 6 * * ? *)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt DailyReportFunction.Arn
+          Id: DailyReportTarget
+
+  DailyReportPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DailyReportFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DailyReportRule.Arn
+
+Outputs:
+  ProcessOrderFunctionArn:
+    Value: !GetAtt ProcessOrderFunction.Arn
+
+  SendEmailFunctionArn:
+    Value: !GetAtt SendEmailFunction.Arn
+
+  DailyReportFunctionArn:
+    Value: !GetAtt DailyReportFunction.Arn
+
+  TestCommand:
+    Value: !Sub |
+      aws sqs send-message --queue-url ${!ImportValue SAA-OrderQueue-Url} \
+        --message-body '{"orderId":"test-001","item":"book","quantity":2}'
+    Description: Send a test message to trigger the full pipeline

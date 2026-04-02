@@ -1,0 +1,296 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  SAA Study Project 2.1 - Multi-AZ Web Application with EC2 Auto Scaling Group,
+  Application Load Balancer, and RDS MySQL Multi-AZ.
+  Deploys its own VPC so it is self-contained.
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t3.micro
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.micro
+  DBPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    Default: SAAstudy123!
+
+Resources:
+
+  # ── VPC ───────────────────────────────────────────────────────────────────
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.1.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags: [{Key: Name, Value: SAA-P21-VPC},{Key: Project, Value: SAA-Study}]
+
+  IGW:
+    Type: AWS::EC2::InternetGateway
+  IGWAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref IGW
+
+  PubSub1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.1.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags: [{Key: Name, Value: Public-1}]
+
+  PubSub2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.1.3.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags: [{Key: Name, Value: Public-2}]
+
+  PrivSub1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.1.2.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags: [{Key: Name, Value: Private-1}]
+
+  PrivSub2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.1.4.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags: [{Key: Name, Value: Private-2}]
+
+  NatEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: IGWAttach
+    Properties:
+      Domain: vpc
+
+  NatGW:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEIP.AllocationId
+      SubnetId: !Ref PubSub1
+
+  PubRT:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+  PubRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IGWAttach
+    Properties:
+      RouteTableId: !Ref PubRT
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref IGW
+  PubSub1Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PubSub1, RouteTableId: !Ref PubRT}
+  PubSub2Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PubSub2, RouteTableId: !Ref PubRT}
+
+  PrivRT:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+  PrivRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivRT
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGW
+  PrivSub1Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PrivSub1, RouteTableId: !Ref PrivRT}
+  PrivSub2Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PrivSub2, RouteTableId: !Ref PrivRT}
+
+  # ── Security Groups ───────────────────────────────────────────────────────
+  ALBSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB - allow HTTP from internet
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0}
+
+  WebSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EC2 - allow HTTP from ALB only
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 80, ToPort: 80, SourceSecurityGroupId: !Ref ALBSG}
+
+  DBSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS - allow MySQL from web tier only
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 3306, ToPort: 3306, SourceSecurityGroupId: !Ref WebSG}
+
+  # ── IAM Role for EC2 (SSM access) ────────────────────────────────────────
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - {Effect: Allow, Principal: {Service: ec2.amazonaws.com}, Action: sts:AssumeRole}
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  EC2Profile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref EC2Role]
+
+  # ── Launch Template ───────────────────────────────────────────────────────
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: SAA-WebApp-LT
+      LaunchTemplateData:
+        ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64}}'
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt EC2Profile.Arn
+        SecurityGroupIds:
+          - !Ref WebSG
+        UserData:
+          Fn::Base64: |
+            #!/bin/bash
+            yum update -y
+            yum install -y httpd stress
+            systemctl start httpd && systemctl enable httpd
+            AZ=$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone)
+            INSTANCE=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+            cat > /var/www/html/index.html <<EOF
+            <h1>SAA Study - Multi-AZ Demo</h1>
+            <p>Served from AZ: <strong>$AZ</strong></p>
+            <p>Instance ID: $INSTANCE</p>
+            <p>Refresh to see load balancing across AZs!</p>
+            EOF
+            echo "OK" > /var/www/html/health
+        TagSpecifications:
+          - ResourceType: instance
+            Tags: [{Key: Name, Value: SAA-WebApp},{Key: Project, Value: SAA-Study}]
+
+  # ── ALB + Target Group ────────────────────────────────────────────────────
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: SAA-MultiAZ-ALB
+      Scheme: internet-facing
+      Type: application
+      Subnets: [!Ref PubSub1, !Ref PubSub2]
+      SecurityGroups: [!Ref ALBSG]
+      Tags: [{Key: Project, Value: SAA-Study}]
+
+  TG:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: SAA-WebApp-TG
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      TargetGroupAttributes:
+        - {Key: deregistration_delay.timeout_seconds, Value: '30'}
+      Tags: [{Key: Project, Value: SAA-Study}]
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - {Type: forward, TargetGroupArn: !Ref TG}
+
+  # ── Auto Scaling Group ────────────────────────────────────────────────────
+  ASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: SAA-WebApp-ASG
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: '2'
+      MaxSize: '6'
+      DesiredCapacity: '2'
+      VPCZoneIdentifier: [!Ref PrivSub1, !Ref PrivSub2]
+      TargetGroupARNs: [!Ref TG]
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 90
+      Tags:
+        - {Key: Name, Value: SAA-WebApp, PropagateAtLaunch: true}
+        - {Key: Project, Value: SAA-Study, PropagateAtLaunch: true}
+
+  # Target tracking scaling policy — maintain 50% CPU
+  CPUScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref ASG
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 50.0
+
+  # ── RDS MySQL Multi-AZ ────────────────────────────────────────────────────
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Multi-AZ RDS subnet group
+      SubnetIds: [!Ref PrivSub1, !Ref PrivSub2]
+      Tags: [{Key: Project, Value: SAA-Study}]
+
+  RDSInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    Properties:
+      DBInstanceIdentifier: saa-multiaz-mysql
+      DBInstanceClass: !Ref DBInstanceClass
+      Engine: mysql
+      EngineVersion: '8.0'
+      MasterUsername: admin
+      MasterUserPassword: !Ref DBPassword
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups: [!Ref DBSG]
+      AllocatedStorage: '20'
+      StorageType: gp3
+      MultiAZ: true               # ← Key feature: Multi-AZ for HA!
+      BackupRetentionPeriod: 1
+      DeletionProtection: false
+      PubliclyAccessible: false
+      Tags: [{Key: Project, Value: SAA-Study}]
+
+Outputs:
+  ALBDNSName:
+    Value: !GetAtt ALB.DNSName
+    Description: Open this in browser - refresh to see Multi-AZ load balancing
+
+  RDSEndpoint:
+    Value: !GetAtt RDSInstance.Endpoint.Address
+    Description: RDS Multi-AZ endpoint (auto-fails over on AZ failure)
+
+  ASGName:
+    Value: !Ref ASG
+    Description: Auto Scaling Group name - use in load-test.sh
