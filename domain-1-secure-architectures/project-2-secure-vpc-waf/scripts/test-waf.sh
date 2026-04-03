@@ -4,7 +4,7 @@
 # Replace ALB_DNS with your actual ALB DNS name before running
 # ─────────────────────────────────────────────────────────────────────────────
 
-ALB_DNS="your-alb-dns-name.us-east-1.elb.amazonaws.com"
+ALB_DNS="SAA-WebApp-ALB-1234567890.us-east-1.elb.amazonaws.com" #Replace this with the newly created ALB name
 
 echo "=========================================="
 echo "  AWS WAF Test Suite - SAA Study Project"

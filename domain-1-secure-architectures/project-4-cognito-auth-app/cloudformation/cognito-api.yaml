@@ -5,6 +5,29 @@ Description: >
 
 Resources:
 
+  CognitoSmsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cognito-idp.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Sub '${AWS::StackName}-cognito-sms'
+      Policies:
+        - PolicyName: CognitoSmsPublishPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: '*'
+
   # ── Cognito User Pool ─────────────────────────────────────────────────────
   UserPool:
     Type: AWS::Cognito::UserPool
@@ -14,6 +37,7 @@ Resources:
         - email
       AutoVerifiedAttributes:
         - email
+        - phone_number
       Policies:
         PasswordPolicy:
           MinimumLength: 8
@@ -22,6 +46,11 @@ Resources:
           RequireUppercase: true
           RequireLowercase: true
       MfaConfiguration: OPTIONAL
+      EnabledMfas:
+        - SMS_MFA
+      SmsConfiguration:
+        ExternalId: !Sub '${AWS::StackName}-cognito-sms'
+        SnsCallerArn: !GetAtt CognitoSmsRole.Arn
       UserPoolTags:
         Project: SAA-Study
 
@@ -150,14 +179,34 @@ Resources:
       Code:
         ZipFile: |
           import json
+
+          def _normalize_groups(groups_claim):
+              if isinstance(groups_claim, list):
+                  return [str(g).strip() for g in groups_claim if str(g).strip()]
+              if isinstance(groups_claim, str):
+                  text = groups_claim.strip()
+                  if not text:
+                      return []
+                  if text.startswith('[') and text.endswith(']'):
+                      try:
+                          parsed = json.loads(text)
+                          if isinstance(parsed, list):
+                              return [str(g).strip() for g in parsed if str(g).strip()]
+                      except Exception:
+                          pass
+                  return [g.strip() for g in text.split(',') if g.strip()]
+              return []
+
           def handler(event, context):
               claims = event.get('requestContext', {}).get('authorizer', {}).get('jwt', {}).get('claims', {})
+              groups = _normalize_groups(claims.get('cognito:groups', []))
               return {
                   'statusCode': 200,
+                  'headers': {'Content-Type': 'application/json'},
                   'body': json.dumps({
                       'user_id': claims.get('sub', 'unknown'),
                       'email': claims.get('email', 'unknown'),
-                      'groups': claims.get('cognito:groups', []),
+                      'groups': groups,
                       'message': 'Profile retrieved successfully'
                   })
               }
@@ -175,13 +224,36 @@ Resources:
       Code:
         ZipFile: |
           import json
+
+          def _normalize_groups(groups_claim):
+              if isinstance(groups_claim, list):
+                  return [str(g).strip() for g in groups_claim if str(g).strip()]
+              if isinstance(groups_claim, str):
+                  text = groups_claim.strip()
+                  if not text:
+                      return []
+                  if text.startswith('[') and text.endswith(']'):
+                      try:
+                          parsed = json.loads(text)
+                          if isinstance(parsed, list):
+                              return [str(g).strip() for g in parsed if str(g).strip()]
+                      except Exception:
+                          pass
+                  return [g.strip() for g in text.split(',') if g.strip()]
+              return []
+
           def handler(event, context):
               claims = event.get('requestContext', {}).get('authorizer', {}).get('jwt', {}).get('claims', {})
-              groups = claims.get('cognito:groups', '')
-              if 'Admins' not in (groups if isinstance(groups, list) else groups.split(',')):
-                  return {'statusCode': 403, 'body': json.dumps({'error': 'Admin access required'})}
+              groups = _normalize_groups(claims.get('cognito:groups', ''))
+              if 'Admins' not in groups:
+                  return {
+                      'statusCode': 403,
+                      'headers': {'Content-Type': 'application/json'},
+                      'body': json.dumps({'error': 'Admin access required', 'groups': groups})
+                  }
               return {
                   'statusCode': 200,
+                  'headers': {'Content-Type': 'application/json'},
                   'body': json.dumps({'message': 'Welcome, Admin!', 'email': claims.get('email')})
               }
       Tags:
