@@ -3,9 +3,9 @@
 # SAA Study Project 3.1 - Deploy Website + Invalidate CloudFront Cache
 # ─────────────────────────────────────────────────────────────────────────────
 
-BUCKET_NAME="saa-cf-origin-YOUR_ACCOUNT_ID"
-DISTRIBUTION_ID="YOUR_CLOUDFRONT_DISTRIBUTION_ID"
-WEBSITE_DIR="./website"
+BUCKET_NAME="saa-cf-origin-YOUR_ACCOUNT_ID" # Replace with your actual s3 bucket name
+DISTRIBUTION_ID="YOUR_CLOUDFRONT_DISTRIBUTION_ID" # Replace with the Cloudfront distribution name
+WEBSITE_DIR="../website"
 
 echo "================================================"
 echo "  Deploy Static Site to S3 + CloudFront"

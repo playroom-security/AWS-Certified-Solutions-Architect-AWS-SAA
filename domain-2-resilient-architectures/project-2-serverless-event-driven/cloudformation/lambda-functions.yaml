@@ -98,7 +98,7 @@ Resources:
       BatchSize: 10
       FunctionResponseTypes:
         - ReportBatchItemFailures   # Partial batch failure support
-      BisectBatchOnFunctionError: true
+      #BisectBatchOnFunctionError: true
 
   # ── Send Email Lambda ─────────────────────────────────────────────────────
   SendEmailFunction:

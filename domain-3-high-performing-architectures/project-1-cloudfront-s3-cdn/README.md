@@ -70,10 +70,15 @@ aws s3 sync website/ s3://saa-cf-origin-ACCOUNT_ID/
 5. Do NOT set bucket for static website hosting — we use CloudFront for that
 
 ### Phase 2: Create ACM Certificate (15 min)
-1. Go to **ACM in us-east-1** (CloudFront requires us-east-1 certificates!)
-2. Request a public certificate for: `*.saa-study.com` and `saa-study.com`
-3. Validation: DNS (add the CNAME record to Route 53)
-4. Wait for certificate status: Issued (~2 minutes with Route 53)
+1. Go to **AWS Certificate Management** and make sure you are in the **us-east-1** Region (N. Virginia) (CloudFront requires us-east-1 certificates!)
+2. Request a public certificate for: `*.saa-study.com` and `saa-study.com` (Click on `Add another name to this certificate`.)
+3. Leave `Disable export` as default in the `Allow export tab`.
+4. Validation method: DNS validation (add the CNAME record to Route 53)
+5. `Key algorithm`: Leave `RSA 2028` as default.
+6. Click `Request`.
+4. Wait for certificate status: Issued (~2 minutes with Route 53).
+
+`Copy the ARN of the newly created AWS Public Certificate`
 
 ### Phase 3: Create CloudFront Distribution (30 min)
 1. Deploy `cloudformation/cloudfront-distribution.yaml`

@@ -1,0 +1,41 @@
+{
+  "_comment": "SAA Study Project 2.2 - Step Functions execution input for saa-order-fulfillment",
+  "_usage": [
+    "Option 1 - AWS Console:",
+    "  Step Functions > saa-order-fulfillment > Start execution > paste this JSON",
+    "",
+    "Option 2 - AWS CLI:",
+    "  aws stepfunctions start-execution \\",
+    "    --state-machine-arn arn:aws:states:us-east-1:ACCOUNT_ID:stateMachine:saa-order-fulfillment \\",
+    "    --name my-test-run-001 \\",
+    "    --input file://events/step-functions-input.json"
+  ],
+  "orderId": "ORD-SF-2026-001",
+  "customerId": "cust-abc123",
+  "customerEmail": "customer@example.com",
+  "item": {
+    "sku": "BOOK-AWS-SAA-001",
+    "name": "AWS Certified Solutions Architect Study Guide",
+    "quantity": 1,
+    "unitPrice": 49.99
+  },
+  "totalAmount": 49.99,
+  "currency": "USD",
+  "shippingAddress": {
+    "line1": "123 Cloud Street",
+    "city": "Seattle",
+    "state": "WA",
+    "zip": "98101",
+    "country": "US"
+  },
+  "paymentMethod": {
+    "type": "CREDIT_CARD",
+    "lastFour": "4242",
+    "token": "tok_test_visa_success"
+  },
+  "metadata": {
+    "source": "web",
+    "sessionId": "sess-xyz-789",
+    "submittedAt": "2026-04-22T10:30:00Z"
+  }
+}

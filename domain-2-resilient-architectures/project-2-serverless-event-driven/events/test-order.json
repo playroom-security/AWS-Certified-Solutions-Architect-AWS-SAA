@@ -1,0 +1,55 @@
+{
+  "_comment": "SAA Study Project 2.2 - Lambda test event for saa-process-order",
+  "_usage": "In AWS Console: Lambda > saa-process-order > Test > paste this JSON",
+  "Records": [
+    {
+      "messageId": "test-msg-001",
+      "receiptHandle": "AQEBwJnKyrHigUMZj6reyNurCGq1G0...",
+      "body": "{\"orderId\":\"ORD-2026-001\",\"item\":\"AWS Study Book\",\"quantity\":2,\"customerId\":\"cust-abc123\",\"price\":49.99}",
+      "attributes": {
+        "ApproximateReceiveCount": "1",
+        "SentTimestamp": "1714512000000",
+        "SenderId": "AIDAIENQZJOLO23YVJ4VO",
+        "ApproximateFirstReceiveTimestamp": "1714512001000"
+      },
+      "messageAttributes": {},
+      "md5OfBody": "e4e68fb7bd0e697a0ae8f1bb342846b0",
+      "eventSource": "aws:sqs",
+      "eventSourceARN": "arn:aws:sqs:us-east-1:123456789012:saa-order-queue",
+      "awsRegion": "us-east-1"
+    },
+    {
+      "messageId": "test-msg-002",
+      "receiptHandle": "AQEBwJnKyrHigUMZj6reyNurCGq1G1...",
+      "body": "{\"orderId\":\"ORD-2026-002\",\"item\":\"Cloud Architecture Poster\",\"quantity\":1,\"customerId\":\"cust-xyz456\",\"price\":19.99}",
+      "attributes": {
+        "ApproximateReceiveCount": "1",
+        "SentTimestamp": "1714512005000",
+        "SenderId": "AIDAIENQZJOLO23YVJ4VO",
+        "ApproximateFirstReceiveTimestamp": "1714512006000"
+      },
+      "messageAttributes": {},
+      "md5OfBody": "d41d8cd98f00b204e9800998ecf8427e",
+      "eventSource": "aws:sqs",
+      "eventSourceARN": "arn:aws:sqs:us-east-1:123456789012:saa-order-queue",
+      "awsRegion": "us-east-1"
+    },
+    {
+      "_comment": "This third record has an invalid body — triggers a batch item failure so you can see the DLQ retry logic in action",
+      "messageId": "test-msg-003-bad",
+      "receiptHandle": "AQEBwJnKyrHigUMZj6reyNurCGq1G2...",
+      "body": "THIS IS NOT VALID JSON {{{{",
+      "attributes": {
+        "ApproximateReceiveCount": "1",
+        "SentTimestamp": "1714512010000",
+        "SenderId": "AIDAIENQZJOLO23YVJ4VO",
+        "ApproximateFirstReceiveTimestamp": "1714512011000"
+      },
+      "messageAttributes": {},
+      "md5OfBody": "abc123",
+      "eventSource": "aws:sqs",
+      "eventSourceARN": "arn:aws:sqs:us-east-1:123456789012:saa-order-queue",
+      "awsRegion": "us-east-1"
+    }
+  ]
+}

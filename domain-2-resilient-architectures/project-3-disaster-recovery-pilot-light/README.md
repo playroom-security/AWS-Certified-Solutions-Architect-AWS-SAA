@@ -63,11 +63,14 @@ FAILOVER TRIGGER (Route 53 health check fails primary)
 5. Copy the AMI to us-west-2: EC2 → AMIs → Copy → select us-west-2
 
 ### Phase 2: Set Up RDS Read Replica in DR Region (30 min)
-1. In RDS → select your primary instance → Actions → Create read replica
-2. Destination region: us-west-2
-3. Instance class: db.t3.micro (smallest for cost)
-4. Note: read replica is running continuously — this is the "pilot light"
-5. Verify replication lag in CloudWatch: `ReplicaLag` metric should be < 1 second
+1. In RDS → select your primary instance → Actions → Create read replica.
+2. `DB instance identifier:` __**saa-primary-readreplica**__
+3. Destination region: us-west-2
+4. Instance class: db.t3.micro (smallest for cost)
+5. Under `Availability`, leave `Multi-AZ DB instance deployment` as default.
+5. Under `Monitoring`, uncheck `Enhance Enhanced monitoring`
+6. Note: read replica is running continuously — this is the "pilot light"
+7. Verify replication lag in CloudWatch: `ReplicaLag` metric should be < 1 second
 
 ### Phase 3: Prepare DR Region Resources (30 min)
 1. Deploy `cloudformation/dr-region.yaml` in us-west-2
@@ -77,7 +80,8 @@ FAILOVER TRIGGER (Route 53 health check fails primary)
 5. RDS read replica endpoint is configured in Launch Template user data
 
 ### Phase 4: Configure Route 53 Failover (45 min)
-1. Create a Route 53 hosted zone (or use an existing one)
+1. Create a Route 53 hosted zone: `saa-study.com` (or use an existing one)
+2. `Type`: Public
 2. Create a **health check** for the Primary ALB DNS:
    - Protocol: HTTP, Path: `/health`, interval: 30s, threshold: 3 failures
 3. Create **Primary record**: `saa-study.example.com` → Primary ALB (failover: PRIMARY)
