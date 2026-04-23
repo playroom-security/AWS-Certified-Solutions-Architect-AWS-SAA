@@ -1,4 +1,5 @@
 # AWS Certified Solutions Architect – Associate (SAA-C03)
+![aws-saa](./assets/aws-saa-logo.png)
 ## Hands-On Study Projects
 
 > **Goal:** Complete these 16 projects over ~4 weeks to reinforce every exam domain through real AWS experience.

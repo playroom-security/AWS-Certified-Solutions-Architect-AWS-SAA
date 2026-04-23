@@ -1,8 +1,6 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: >
-  SAA Study Project 2.4 - ECS Fargate Services with ALB path-based routing.
-  Requires task-definitions.yaml and a VPC with public/private subnets.
-  Deploys its own networking for simplicity.
+Description: |
+  SAA Study Project 2.4 - ECS Fargate Services with ALB path-based routing. Requires task-definitions.yaml and a VPC with public/private subnets. Deploys its own networking for simplicity.
 
 Resources:
 
@@ -13,42 +11,60 @@ Resources:
       CidrBlock: 10.30.0.0/16
       EnableDnsHostnames: true
       EnableDnsSupport: true
-      Tags: [{Key: Name, Value: SAA-ECS-VPC},{Key: Project, Value: SAA-Study}]
+      Tags:
+        - Key: Name
+          Value: SAA-ECS-VPC
+        - Key: Project
+          Value: SAA-Study
 
   IGW:
     Type: AWS::EC2::InternetGateway
   IGWAttach:
     Type: AWS::EC2::VPCGatewayAttachment
-    Properties: {VpcId: !Ref VPC, InternetGatewayId: !Ref IGW}
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref IGW
 
   PubSub1:
     Type: AWS::EC2::Subnet
     Properties:
       VpcId: !Ref VPC
       CidrBlock: 10.30.1.0/24
-      AvailabilityZone: !Select [0, !GetAZs '']
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs ''
       MapPublicIpOnLaunch: true
   PubSub2:
     Type: AWS::EC2::Subnet
     Properties:
       VpcId: !Ref VPC
       CidrBlock: 10.30.3.0/24
-      AvailabilityZone: !Select [1, !GetAZs '']
+      AvailabilityZone: !Select
+        - 1
+        - !GetAZs ''
       MapPublicIpOnLaunch: true
 
   PubRT:
     Type: AWS::EC2::RouteTable
-    Properties: {VpcId: !Ref VPC}
+    Properties:
+      VpcId: !Ref VPC
   PubRoute:
     Type: AWS::EC2::Route
     DependsOn: IGWAttach
-    Properties: {RouteTableId: !Ref PubRT, DestinationCidrBlock: 0.0.0.0/0, GatewayId: !Ref IGW}
+    Properties:
+      RouteTableId: !Ref PubRT
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref IGW
   PubSub1Assoc:
     Type: AWS::EC2::SubnetRouteTableAssociation
-    Properties: {SubnetId: !Ref PubSub1, RouteTableId: !Ref PubRT}
+    Properties:
+      SubnetId: !Ref PubSub1
+      RouteTableId: !Ref PubRT
   PubSub2Assoc:
     Type: AWS::EC2::SubnetRouteTableAssociation
-    Properties: {SubnetId: !Ref PubSub2, RouteTableId: !Ref PubRT}
+    Properties:
+      SubnetId: !Ref PubSub2
+      RouteTableId: !Ref PubRT
 
   # ── Security Groups ───────────────────────────────────────────────────────
   ALBSG:
@@ -57,7 +73,10 @@ Resources:
       GroupDescription: ALB - HTTP from internet
       VpcId: !Ref VPC
       SecurityGroupIngress:
-        - {IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0}
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
 
   ECSTaskSG:
     Type: AWS::EC2::SecurityGroup
@@ -65,7 +84,10 @@ Resources:
       GroupDescription: ECS Tasks - allow port 3000 from ALB
       VpcId: !Ref VPC
       SecurityGroupIngress:
-        - {IpProtocol: tcp, FromPort: 3000, ToPort: 3000, SourceSecurityGroupId: !Ref ALBSG}
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          SourceSecurityGroupId: !Ref ALBSG
 
   # ── ALB + Target Groups ───────────────────────────────────────────────────
   ALB:
@@ -74,8 +96,11 @@ Resources:
       Name: saa-microservices-alb
       Scheme: internet-facing
       Type: application
-      Subnets: [!Ref PubSub1, !Ref PubSub2]
-      SecurityGroups: [!Ref ALBSG]
+      Subnets:
+        - !Ref PubSub1
+        - !Ref PubSub2
+      SecurityGroups:
+        - !Ref ALBSG
 
   UsersTG:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
@@ -83,7 +108,7 @@ Resources:
       Name: saa-users-tg
       Port: 3000
       Protocol: HTTP
-      TargetType: ip              # Required for Fargate (awsvpc network mode)
+      TargetType: ip # Required for Fargate (awsvpc network mode)
       VpcId: !Ref VPC
       HealthCheckPath: /users/health
       HealthCheckIntervalSeconds: 30
@@ -121,7 +146,7 @@ Resources:
         - Type: fixed-response
           FixedResponseConfig:
             StatusCode: '404'
-            MessageBody: 'Route not found'
+            MessageBody: Route not found
 
   UsersRule:
     Type: AWS::ElasticLoadBalancingV2::ListenerRule
@@ -130,7 +155,8 @@ Resources:
       Priority: 10
       Conditions:
         - Field: path-pattern
-          Values: ['/users*']
+          Values:
+            - /users*
       Actions:
         - Type: forward
           TargetGroupArn: !Ref UsersTG
@@ -142,7 +168,8 @@ Resources:
       Priority: 20
       Conditions:
         - Field: path-pattern
-          Values: ['/products*']
+          Values:
+            - /products*
       Actions:
         - Type: forward
           TargetGroupArn: !Ref ProductsTG
@@ -154,7 +181,8 @@ Resources:
       Priority: 30
       Conditions:
         - Field: path-pattern
-          Values: ['/orders*']
+          Values:
+            - /orders*
       Actions:
         - Type: forward
           TargetGroupArn: !Ref OrdersTG
@@ -171,9 +199,12 @@ Resources:
       DesiredCount: 2
       NetworkConfiguration:
         AwsvpcConfiguration:
-          AssignPublicIp: ENABLED    # Needed if no NAT GW (lab simplification)
-          Subnets: [!Ref PubSub1, !Ref PubSub2]
-          SecurityGroups: [!Ref ECSTaskSG]
+          AssignPublicIp: ENABLED # Needed if no NAT GW (lab simplification)
+          Subnets:
+            - !Ref PubSub1
+            - !Ref PubSub2
+          SecurityGroups:
+            - !Ref ECSTaskSG
       LoadBalancers:
         - ContainerName: users-service
           ContainerPort: 3000
@@ -194,8 +225,11 @@ Resources:
       NetworkConfiguration:
         AwsvpcConfiguration:
           AssignPublicIp: ENABLED
-          Subnets: [!Ref PubSub1, !Ref PubSub2]
-          SecurityGroups: [!Ref ECSTaskSG]
+          Subnets:
+            - !Ref PubSub1
+            - !Ref PubSub2
+          SecurityGroups:
+            - !Ref ECSTaskSG
       LoadBalancers:
         - ContainerName: products-service
           ContainerPort: 3000
@@ -213,8 +247,11 @@ Resources:
       NetworkConfiguration:
         AwsvpcConfiguration:
           AssignPublicIp: ENABLED
-          Subnets: [!Ref PubSub1, !Ref PubSub2]
-          SecurityGroups: [!Ref ECSTaskSG]
+          Subnets:
+            - !Ref PubSub1
+            - !Ref PubSub2
+          SecurityGroups:
+            - !Ref ECSTaskSG
       LoadBalancers:
         - ContainerName: orders-service
           ContainerPort: 3000
@@ -226,7 +263,7 @@ Resources:
     Properties:
       MaxCapacity: 10
       MinCapacity: 2
-      ResourceId: !Sub 'service/${!ImportValue SAA-ECS-ClusterName}/saa-users-service'
+      ResourceId: !Sub service/${!ImportValue SAA-ECS-ClusterName}/saa-users-service
       ScalableDimension: ecs:service:DesiredCount
       ServiceNamespace: ecs
 
@@ -237,7 +274,7 @@ Resources:
       PolicyType: TargetTrackingScaling
       ScalingTargetId: !Ref UsersScalableTarget
       TargetTrackingScalingPolicyConfiguration:
-        TargetValue: 70.0
+        TargetValue: 70
         PredefinedMetricSpecification:
           PredefinedMetricType: ECSServiceAverageCPUUtilization
 
